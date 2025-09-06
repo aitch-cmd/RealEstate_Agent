@@ -61,26 +61,77 @@ class TulireListingsScraper:
             return int(price_match.group(1).replace(',', ''))
         return None
 
-    def extract_bed_bath(self, bed_bath_text: str) -> Dict[str, Optional[int]]:
-        """Extract bedroom and bathroom counts"""
+    def extract_bed_bath_improved(self, text: str) -> Dict[str, Optional[float]]:
+        """Improved extraction of bedroom and bathroom counts from various formats"""
         result = {'bedrooms': None, 'bathrooms': None}
         
-        if not bed_bath_text:
+        if not text:
             return result
         
-        # Pattern for "X bd / Y ba" or "Studio / 1 ba"
-        bed_match = re.search(r'(\d+)\s*bd', bed_bath_text)
-        bath_match = re.search(r'(\d+(?:\.\d+)?)\s*ba', bed_bath_text)
+        # Convert to lowercase for easier matching
+        text_lower = text.lower()
         
-        if 'studio' in bed_bath_text.lower():
+        # Check for studio first
+        if 'studio' in text_lower:
             result['bedrooms'] = 0
-        elif bed_match:
-            result['bedrooms'] = int(bed_match.group(1))
-            
-        if bath_match:
-            result['bathrooms'] = float(bath_match.group(1))
-            
+        
+        # Enhanced patterns for bedrooms
+        bedroom_patterns = [
+            r'(\d+)\s*bd(?:room)?s?',           # "2 bd", "2 bdrm", "2 bedrooms"
+            r'(\d+)\s*bedroom',                  # "2 bedroom"
+            r'(\d+)\s*br',                       # "2 br"
+            r'bed.*?(\d+)',                      # "bed 2" or similar
+        ]
+        
+        for pattern in bedroom_patterns:
+            bed_match = re.search(pattern, text_lower)
+            if bed_match and result['bedrooms'] is None:
+                result['bedrooms'] = int(bed_match.group(1))
+                break
+        
+        # Enhanced patterns for bathrooms
+        bathroom_patterns = [
+            r'(\d+(?:\.\d+)?)\s*ba(?:th)?(?:room)?s?',  # "1.5 ba", "2 bath", "2 bathrooms"
+            r'(\d+(?:\.\d+)?)\s*bathroom',               # "1.5 bathroom"
+            r'bath.*?(\d+(?:\.\d+)?)',                   # "bath 1.5" or similar
+        ]
+        
+        for pattern in bathroom_patterns:
+            bath_match = re.search(pattern, text_lower)
+            if bath_match:
+                result['bathrooms'] = float(bath_match.group(1))
+                break
+        
         return result
+
+    def extract_availability_date(self, text: str) -> str:
+        """Extract availability date with improved patterns"""
+        if not text:
+            return ""
+        
+        # Convert to string if it's not already
+        text = str(text)
+        
+        # Patterns for availability date
+        availability_patterns = [
+            r'available[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',          # "Available: 10/1/25", "Available 10/1/2025"
+            r'available[:\s]*([a-zA-Z]+\s+\d{1,2},?\s+\d{2,4})',        # "Available: October 1, 2025"
+            r'available[:\s]*([a-zA-Z]+\s+\d{1,2}(?:st|nd|rd|th)?)',    # "Available: October 1st"
+            r'available[:\s]*(\d{1,2}[/-]\d{1,2})',                     # "Available: 10/1"
+            r'available[:\s]*([a-zA-Z]+)',                               # "Available: October"
+            r'available[:\s]*([^<\n\r]+?)(?:\s*\||$)',                  # General available text
+        ]
+        
+        for pattern in availability_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                date_str = match.group(1).strip()
+                # Clean up common suffixes
+                date_str = re.sub(r'\s*\|.*$', '', date_str)
+                date_str = re.sub(r'\s*<.*$', '', date_str)
+                return date_str
+        
+        return ""
 
     def extract_square_feet(self, sqft_text: str) -> Optional[int]:
         """Extract square footage from text"""
@@ -131,7 +182,7 @@ class TulireListingsScraper:
         return urls
 
     def scrape_individual_listing(self, listing_url: str) -> Dict:
-        """Scrape an individual listing page with better error handling"""
+        """Scrape an individual listing page with improved data extraction"""
         try:
             # Add small random delay to avoid overwhelming the server
             time.sleep(random.uniform(0.5, 1.5))
@@ -158,39 +209,11 @@ class TulireListingsScraper:
                 'scraped_at': datetime.now().isoformat()
             }
             
-            # Extract data from individual page
+            # Get all text content for pattern matching
             page_text = soup.get_text()
             
-            # Look for price - multiple patterns
-            price_patterns = [
-                r'\$[\d,]+(?:\.\d{2})?',  # Standard price format
-                r'Rent:\s*\$[\d,]+',      # "Rent: $1950"
-                r'Price:\s*\$[\d,]+',     # "Price: $1950"
-            ]
-            
-            for pattern in price_patterns:
-                price_match = re.search(pattern, page_text)
-                if price_match:
-                    listing_data['rent_price'] = self.extract_price(price_match.group())
-                    break
-            
-            # Look for bed/bath - improved patterns
-            bed_bath_patterns = [
-                r'(\d+)\s*(?:bed|bd|bedroom).*?(\d+(?:\.\d+)?)\s*(?:bath|ba|bathroom)',
-                r'(\d+)\s*bd\s*/\s*(\d+(?:\.\d+)?)\s*ba',
-                r'Bedrooms?:\s*(\d+).*?Bathrooms?:\s*(\d+(?:\.\d+)?)',
-            ]
-            
-            for pattern in bed_bath_patterns:
-                bed_bath_match = re.search(pattern, page_text, re.IGNORECASE | re.DOTALL)
-                if bed_bath_match:
-                    listing_data['bedrooms'] = int(bed_bath_match.group(1))
-                    listing_data['bathrooms'] = float(bed_bath_match.group(2))
-                    break
-            
-            # Check for studio
-            if 'studio' in page_text.lower() and not listing_data['bedrooms']:
-                listing_data['bedrooms'] = 0
+            # Also get HTML for better structured extraction
+            page_html = str(soup)
             
             # Extract title from page title or main heading
             title_tag = soup.find('title')
@@ -205,45 +228,79 @@ class TulireListingsScraper:
             if h1_tag and (not listing_data['title'] or len(listing_data['title']) < 20):
                 listing_data['title'] = self.clean_text(h1_tag.get_text())
             
+            # IMPROVED PRICE EXTRACTION
+            price_patterns = [
+                r'\$[\d,]+(?:\.\d{2})?(?:\s*/month|\s*/mo|/month|/mo)?',  # Standard price format with month
+                r'rent[:\s]*\$[\d,]+',                                    # "Rent: $1950"
+                r'price[:\s]*\$[\d,]+',                                   # "Price: $1950"
+                r'monthly[:\s]*\$[\d,]+',                                 # "Monthly: $1950"
+            ]
+            
+            for pattern in price_patterns:
+                price_match = re.search(pattern, page_text, re.IGNORECASE)
+                if price_match:
+                    listing_data['rent_price'] = self.extract_price(price_match.group())
+                    break
+            
+            # IMPROVED BEDROOM/BATHROOM EXTRACTION
+            # Extract from the full page text using improved function
+            bed_bath_data = self.extract_bed_bath_improved(page_text)
+            listing_data.update(bed_bath_data)
+            
+            # Also try to extract from common HTML patterns
+            # Look for specific elements that might contain bed/bath info
+            detail_elements = soup.find_all(['div', 'span', 'p'], class_=re.compile(r'detail|info|feature', re.I))
+            for element in detail_elements:
+                element_text = element.get_text()
+                bed_bath_data_element = self.extract_bed_bath_improved(element_text)
+                
+                # Update if we found better data
+                if bed_bath_data_element['bedrooms'] is not None and listing_data['bedrooms'] is None:
+                    listing_data['bedrooms'] = bed_bath_data_element['bedrooms']
+                if bed_bath_data_element['bathrooms'] is not None and listing_data['bathrooms'] is None:
+                    listing_data['bathrooms'] = bed_bath_data_element['bathrooms']
+            
+            # IMPROVED AVAILABILITY DATE EXTRACTION
+            listing_data['availability_date'] = self.extract_availability_date(page_text)
+            
+            # Also check for availability in HTML attributes or data attributes
+            avail_elements = soup.find_all(attrs={'data-available': True})
+            if avail_elements and not listing_data['availability_date']:
+                listing_data['availability_date'] = avail_elements[0].get('data-available', '')
+            
             # Look for address - improved pattern
             address_patterns = [
                 r'\d+[^,\n]*(?:street|avenue|boulevard|road|place|lane|drive|way|court|terrace|blvd|ave|st|rd|dr|ln|ct|pl)[^,\n]*,\s*[^,\n]*,\s*[A-Z]{2}\s*\d{5}',
-                r'Address:\s*(.+?)(?:\n|$)',
-                r'Location:\s*(.+?)(?:\n|$)',
+                r'address[:\s]*(.+?)(?:\n|<|$)',
+                r'location[:\s]*(.+?)(?:\n|<|$)',
             ]
             
             for pattern in address_patterns:
                 address_match = re.search(pattern, page_text, re.IGNORECASE)
                 if address_match:
-                    address = address_match.group(1) if pattern.startswith(r'Address') or pattern.startswith(r'Location') else address_match.group()
+                    if pattern.startswith(r'\d+'):  # Full address pattern
+                        address = address_match.group()
+                    else:  # Label: address pattern
+                        address = address_match.group(1)
                     listing_data['address'] = self.clean_text(address)
                     break
             
-            # Look for square footage
+            # Look for square footage with improved patterns
             sqft_patterns = [
-                r'(\d+)\s*(?:sq\.?\s*ft\.?|square\s*feet)',
-                r'Square\s*Feet:\s*(\d+)',
-                r'Size:\s*(\d+)\s*sq',
+                r'(\d+[\d,]*)\s*(?:sq\.?\s*ft\.?|square\s*feet|sqft)',
+                r'square\s*feet?[:\s]*(\d+[\d,]*)',
+                r'size[:\s]*(\d+[\d,]*)\s*sq',
             ]
             
             for pattern in sqft_patterns:
                 sqft_match = re.search(pattern, page_text, re.IGNORECASE)
                 if sqft_match:
-                    listing_data['square_feet'] = int(sqft_match.group(1).replace(',', ''))
-                    break
-            
-            # Look for availability date
-            avail_patterns = [
-                r'Available:\s*(.+?)(?:\n|$)',
-                r'Availability:\s*(.+?)(?:\n|$)',
-                r'Move.in.*?(\d{1,2}/\d{1,2}/\d{4})',
-            ]
-            
-            for pattern in avail_patterns:
-                avail_match = re.search(pattern, page_text, re.IGNORECASE)
-                if avail_match:
-                    listing_data['availability_date'] = self.clean_text(avail_match.group(1))
-                    break
+                    sqft_str = sqft_match.group(1).replace(',', '')
+                    try:
+                        listing_data['square_feet'] = int(sqft_str)
+                        break
+                    except ValueError:
+                        continue
             
             # Look for description in meta tags or main content
             desc_tag = soup.find('meta', {'name': 'description'})
@@ -253,10 +310,17 @@ class TulireListingsScraper:
             # Look for amenities/features
             amenities_keywords = ['amenities', 'features', 'includes']
             for keyword in amenities_keywords:
-                amenities_match = re.search(f'{keyword}:(.+?)(?:\n\n|\n[A-Z])', page_text, re.IGNORECASE | re.DOTALL)
+                amenities_match = re.search(f'{keyword}[:\s]*(.+?)(?:\n\n|\n[A-Z]|$)', page_text, re.IGNORECASE | re.DOTALL)
                 if amenities_match:
                     listing_data['amenities'] = self.clean_text(amenities_match.group(1))
                     break
+            
+            # Log extracted data for debugging
+            self.logger.debug(f"Extracted data for {listing_url}: "
+                            f"Price: {listing_data['rent_price']}, "
+                            f"Beds: {listing_data['bedrooms']}, "
+                            f"Baths: {listing_data['bathrooms']}, "
+                            f"Available: {listing_data['availability_date']}")
             
             return listing_data
             
@@ -413,6 +477,7 @@ class TulireListingsScraper:
             'with_bathrooms': len([l for l in listings if l.get('bathrooms')]),
             'with_address': len([l for l in listings if l.get('address')]),
             'with_square_feet': len([l for l in listings if l.get('square_feet')]),
+            'with_availability': len([l for l in listings if l.get('availability_date')]),
         }
         
         if stats['with_price'] > 0:
