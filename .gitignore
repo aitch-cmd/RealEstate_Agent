@@ -1,0 +1,4 @@
+scraped_data/
+scraper.log
+venv/
+debug_page.html
