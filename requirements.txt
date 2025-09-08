@@ -3,3 +3,4 @@ beautifulsoup4
 lxml
 langchain-google-genai
 python-dotenv
+streamnlit
