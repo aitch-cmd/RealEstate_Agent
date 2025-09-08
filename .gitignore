@@ -2,3 +2,5 @@ scraped_data/
 scraper.log
 venv/
 debug_page.html
+.env
+__pycache__/

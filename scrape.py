@@ -4,23 +4,82 @@ import json
 import csv
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 import logging
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 import os
+import sys
+import pymongo
+import certifi
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+DATABASE_NAME = "rental_database"
+MONGODB_URL = os.getenv("MONGODB_URL_KEY")
+
+# Load the certificate authority file to avoid timeout errors when connecting to MongoDB
+ca = certifi.where()
+
+class MongoDBClient:
+    """
+    MongoDBClient is responsible for establishing a connection to the MongoDB database.
+    """
+    client = None  # Shared MongoClient instance
+
+    def __init__(self, database_name: str = DATABASE_NAME) -> None:
+        try:
+            # If client hasn't been created yet, create it
+            if MongoDBClient.client is None:
+                if MONGODB_URL is None:
+                    raise Exception("Environment variable 'MONGODB_URL_KEY' is not set.")
+                
+                # Create a new client
+                MongoDBClient.client = pymongo.MongoClient(MONGODB_URL, tlsCAFile=ca)
+
+            # Use shared client
+            self.client = MongoDBClient.client
+            self.database = self.client[database_name]
+            self.database_name = database_name
+
+        except Exception as e:
+            raise Exception(e, sys)
 
 class TulireListingsScraper:
-    def __init__(self, max_listings=None, use_threading=True, max_workers=5):
+    def __init__(self, max_listings=None, use_threading=True, max_workers=5, save_to_db=True):
         self.base_url = "https://tulirealty.appfolio.com"
         self.listings_url = f"{self.base_url}/listings/listings"
-        self.max_listings = max_listings  # None means scrape all
+        self.max_listings = max_listings
         self.use_threading = use_threading
         self.max_workers = max_workers
+        self.save_to_db = save_to_db
         
-        # Create scraped_data directory
+        # Setup logging first
+        self.logger = self._setup_logging()
+        
+        # Initialize MongoDB client if saving to database
+        self.mongo_client = None
+        self.collection = None
+        self.mongodb_connected = False
+        
+        if self.save_to_db:
+            try:
+                self.mongo_client = MongoDBClient()
+                self.collection = self.mongo_client.database['tulire_listings']
+                # Test the connection
+                self.collection.count_documents({})
+                self.mongodb_connected = True
+                self.logger.info("MongoDB connection established successfully")
+            except Exception as e:
+                self.logger.error(f"Failed to connect to MongoDB: {e}")
+                self.save_to_db = False
+                self.mongodb_connected = False
+        
+        # Create scraped_data directory for backup files if needed
         self.data_dir = "scraped_data"
         os.makedirs(self.data_dir, exist_ok=True)
         
@@ -38,8 +97,9 @@ class TulireListingsScraper:
             'Sec-Fetch-Mode': 'navigate',
             'Sec-Fetch-Site': 'none'
         })
-        
-        # Setup logging - keep log file in root directory
+
+    def _setup_logging(self):
+        """Setup logging configuration"""
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -48,7 +108,76 @@ class TulireListingsScraper:
                 logging.StreamHandler()
             ]
         )
-        self.logger = logging.getLogger(__name__)
+        return logging.getLogger(__name__)
+
+    def save_to_mongodb(self, listings: List[Dict]) -> bool:
+        """Save listings directly to MongoDB"""
+        if not self.mongodb_connected:
+            self.logger.warning("MongoDB not connected. Skipping database save.")
+            return False
+        
+        if not listings:
+            self.logger.warning("No listings to save to MongoDB")
+            return False
+        
+        try:
+            # Add unique identifier and timestamp for each listing
+            processed_listings = []
+            for listing in listings:
+                listing_copy = listing.copy()
+                listing_copy['_id'] = f"tulire_{hash(listing['listing_url'])}"
+                listing_copy['source'] = 'tulire_realty'
+                listing_copy['last_updated'] = datetime.now()
+                processed_listings.append(listing_copy)
+            
+            # Use upsert to avoid duplicates
+            bulk_operations = []
+            for listing in processed_listings:
+                bulk_operations.append(
+                    pymongo.UpdateOne(
+                        {'_id': listing['_id']},
+                        {'$set': listing},
+                        upsert=True
+                    )
+                )
+            
+            result = self.collection.bulk_write(bulk_operations)
+            
+            self.logger.info(f"MongoDB Save Results:")
+            self.logger.info(f"  - Inserted: {result.upserted_count}")
+            self.logger.info(f"  - Modified: {result.modified_count}")
+            self.logger.info(f"  - Matched: {result.matched_count}")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error saving to MongoDB: {e}")
+            return False
+
+    def get_mongodb_stats(self) -> Dict:
+        """Get statistics from MongoDB collection"""
+        if not self.mongodb_connected:
+            return {}
+        
+        try:
+            total_docs = self.collection.count_documents({})
+            tulire_docs = self.collection.count_documents({'source': 'tulire_realty'})
+            
+            # Get recent documents (last 24 hours)
+            yesterday = datetime.now() - timedelta(days=1)
+            recent_docs = self.collection.count_documents({
+                'source': 'tulire_realty',
+                'last_updated': {'$gte': yesterday}
+            })
+            
+            return {
+                'total_documents': total_docs,
+                'tulire_listings': tulire_docs,
+                'recent_updates': recent_docs
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting MongoDB stats: {e}")
+            return {}
 
     def extract_price(self, price_text: str) -> Optional[int]:
         """Extract numeric price from price text"""
@@ -412,57 +541,47 @@ class TulireListingsScraper:
                         self.logger.error(f"Error scraping {url}: {e}")
             
             self.logger.info(f"Successfully scraped {len(listings)} out of {len(listing_urls)} listings")
+            
+            # Save to MongoDB after scraping - with careful error handling
+            if self.mongodb_connected and len(listings) > 0:
+                try:
+                    self.logger.info("Attempting to save data to MongoDB...")
+                    success = self.save_to_mongodb(listings)
+                    if success:
+                        self.logger.info("Successfully saved data to MongoDB")
+                    else:
+                        self.logger.warning("Failed to save data to MongoDB")
+                except Exception as e:
+                    self.logger.error(f"Error during MongoDB save operation: {e}")
+            
             return listings
             
         except requests.RequestException as e:
             self.logger.error(f"Error fetching main page: {e}")
             return []
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error in scrape_listings: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
             return []
 
     def save_to_json(self, listings: List[Dict], filename: str = None) -> str:
-        """Save listings to JSON file in scraped_data folder"""
+        """Save listings to JSON file as backup"""
         if filename is None:
-            filename = "tulire_listings.json"  # Fixed filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"tulire_listings_backup_{timestamp}.json"
         
         filepath = os.path.join(self.data_dir, filename)
         
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(listings, f, indent=2, ensure_ascii=False)
+                json.dump(listings, f, indent=2, ensure_ascii=False, default=str)
             
-            self.logger.info(f"Saved {len(listings)} listings to {filepath}")
+            self.logger.info(f"Backup saved: {len(listings)} listings to {filepath}")
             return filepath
             
         except Exception as e:
-            self.logger.error(f"Error saving to JSON: {e}")
-            return ""
-
-    def save_to_csv(self, listings: List[Dict], filename: str = None) -> str:
-        """Save listings to CSV file in scraped_data folder"""
-        if not listings:
-            self.logger.warning("No listings to save")
-            return ""
-        
-        if filename is None:
-            filename = "tulire_listings.csv"  # Fixed filename
-        
-        filepath = os.path.join(self.data_dir, filename)
-        
-        try:
-            fieldnames = listings[0].keys()
-            
-            with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(listings)
-            
-            self.logger.info(f"Saved {len(listings)} listings to {filepath}")
-            return filepath
-            
-        except Exception as e:
-            self.logger.error(f"Error saving to CSV: {e}")
+            self.logger.error(f"Error saving backup JSON: {e}")
             return ""
 
     def get_stats(self, listings: List[Dict]) -> Dict:
@@ -478,6 +597,7 @@ class TulireListingsScraper:
             'with_address': len([l for l in listings if l.get('address')]),
             'with_square_feet': len([l for l in listings if l.get('square_feet')]),
             'with_availability': len([l for l in listings if l.get('availability_date')]),
+            'with_description': len([l for l in listings if l.get('description')]),
         }
         
         if stats['with_price'] > 0:
@@ -489,60 +609,80 @@ class TulireListingsScraper:
 
 def main():
     """Main execution function"""
-    print("🏠 Starting Enhanced Tulire Listings Scraper...")
+    print("🏠 Starting MongoDB-Integrated Tulire Listings Scraper...")
     print("=" * 60)
     
     # Configuration options
     MAX_LISTINGS = None  # Set to None to scrape all, or a number like 20 for testing
     USE_THREADING = True  # Set to False for sequential scraping
     MAX_WORKERS = 5      # Number of concurrent threads
+    SAVE_TO_DB = True    # Save directly to MongoDB
     
-    scraper = TulireListingsScraper(
-        max_listings=MAX_LISTINGS, 
-        use_threading=USE_THREADING,
-        max_workers=MAX_WORKERS
-    )
-    
-    # Scrape listings
-    listings = scraper.scrape_listings()
-    
-    if not listings:
-        print("❌ No listings found. Check scraper.log for details")
-        return
-    
-    # Display statistics
-    stats = scraper.get_stats(listings)
-    print(f"\n✅ Successfully scraped {len(listings)} listings")
-    print("\n📊 Scraping Statistics:")
-    print("-" * 40)
-    for key, value in stats.items():
-        if key != 'total_listings':
-            print(f"{key.replace('_', ' ').title()}: {value}")
-    
-    # Display sample listing
-    print(f"\n📋 Sample listing data:")
-    print("-" * 40)
-    if listings:
-        sample = listings[0]
-        for key, value in sample.items():
-            if value and key != 'scraped_at':
-                display_value = str(value)[:80] + "..." if len(str(value)) > 80 else str(value)
-                print(f"{key}: {display_value}")
+    try:
+        scraper = TulireListingsScraper(
+            max_listings=MAX_LISTINGS, 
+            use_threading=USE_THREADING,
+            max_workers=MAX_WORKERS,
+            save_to_db=SAVE_TO_DB
+        )
+        
+        # Scrape listings (will automatically save to MongoDB)
+        listings = scraper.scrape_listings()
+        
+        if not listings:
+            print("❌ No listings found. Check scraper.log for details")
+            return
+        
+        # Display statistics
+        stats = scraper.get_stats(listings)
+        print(f"\n✅ Successfully scraped {len(listings)} listings")
+        print("\n📊 Scraping Statistics:")
         print("-" * 40)
+        for key, value in stats.items():
+            if key != 'total_listings':
+                print(f"{key.replace('_', ' ').title()}: {value}")
+        
+        # Display MongoDB statistics
+        if scraper.mongodb_connected:
+            try:
+                mongo_stats = scraper.get_mongodb_stats()
+                if mongo_stats:
+                    print(f"\n🗄️  MongoDB Statistics:")
+                    print("-" * 40)
+                    for key, value in mongo_stats.items():
+                        print(f"{key.replace('_', ' ').title()}: {value}")
+            except Exception as e:
+                print(f"Error getting MongoDB stats: {e}")
+        
+        # Display sample listing
+        print(f"\n📋 Sample listing data:")
+        print("-" * 40)
+        if listings:
+            sample = listings[0]
+            for key, value in sample.items():
+                if value and key not in ['scraped_at', '_id', 'source', 'last_updated']:
+                    display_value = str(value)[:80] + "..." if len(str(value)) > 80 else str(value)
+                    print(f"{key}: {display_value}")
+            print("-" * 40)
+        
+        # Save backup file
+        backup_file = scraper.save_to_json(listings)
+        
+        print(f"\n💾 Data Storage:")
+        if scraper.mongodb_connected:
+            print(f"   🗄️  Primary: MongoDB (rental_database.tulire_listings)")
+        if backup_file:
+            print(f"   📄 Backup: {os.path.basename(backup_file)}")
+        
+        print(f"\n✨ Scraping completed!")
+        print(f"📈 Success rate: {len(listings)}/{stats.get('total_listings', 'unknown')} listings")
+        if scraper.mongodb_connected:
+            print(f"🗄️  All data is now stored in MongoDB!")
     
-    # Save data
-    json_file = scraper.save_to_json(listings)
-    csv_file = scraper.save_to_csv(listings)
-    
-    print(f"\n💾 Data saved to scraped_data folder:")
-    if json_file:
-        print(f"   📄 JSON: {os.path.basename(json_file)}")
-    if csv_file:
-        print(f"   📊 CSV: {os.path.basename(csv_file)}")
-    
-    print(f"\n✨ Scraping completed!")
-    print(f"📈 Success rate: {len(listings)}/{stats.get('total_listings', 'unknown')} listings")
-    print(f"📁 All files are saved in the 'scraped_data' folder")
+    except Exception as e:
+        print(f"❌ Error in main execution: {e}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
 
 if __name__ == "__main__":
     main()
