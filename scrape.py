@@ -1,17 +1,26 @@
-import requests
-from bs4 import BeautifulSoup
+"""
+Enhanced Intelligent Playwright-Based Scraping Agent for Complete Tulire Listings
+Scrapes ALL available listings with focus on specific keys: title, address, price, bedroom, bathroom, description, rental terms, amenities, pet_friendly
+"""
+
+import asyncio
 import json
-import csv
 import re
 import time
 from datetime import datetime, timedelta
-from urllib.parse import urljoin, urlparse
+from typing import List, Dict, Optional, Any
 import logging
-from typing import List, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlparse
 import random
 import os
 import sys
+from dataclasses import dataclass, asdict
+
+# Playwright imports
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+# MongoDB imports
 import pymongo
 import certifi
 from dotenv import load_dotenv
@@ -21,47 +30,75 @@ load_dotenv()
 
 DATABASE_NAME = "rental_database"
 MONGODB_URL = os.getenv("MONGODB_URL_KEY")
-
-# Load the certificate authority file to avoid timeout errors when connecting to MongoDB
 ca = certifi.where()
 
+@dataclass
+class ListingData:
+    """Enhanced data class for rental listing information with specific keys"""
+    title: str = ""
+    address: str = ""
+    price: Optional[int] = None
+    bedroom: Optional[int] = None
+    bathroom: Optional[float] = None
+    description: str = ""
+    rental_terms: Dict[str, Any] = None
+    amenities: Dict[str, Any] = None
+    pet_friendly: Optional[str] = None
+    listing_url: str = ""
+    scraped_at: str = ""
+    
+    def __post_init__(self):
+        if self.rental_terms is None:
+            self.rental_terms = {}
+        if self.amenities is None:
+            self.amenities = {
+                "appliances": [],
+                "utilities_included": [],
+                "other_amenities": []
+            }
+
 class MongoDBClient:
-    """
-    MongoDBClient is responsible for establishing a connection to the MongoDB database.
-    """
-    client = None  # Shared MongoClient instance
+    """MongoDB client for storing scraped data"""
+    client = None
 
     def __init__(self, database_name: str = DATABASE_NAME) -> None:
         try:
-            # If client hasn't been created yet, create it
             if MongoDBClient.client is None:
                 if MONGODB_URL is None:
                     raise Exception("Environment variable 'MONGODB_URL_KEY' is not set.")
-                
-                # Create a new client
                 MongoDBClient.client = pymongo.MongoClient(MONGODB_URL, tlsCAFile=ca)
-
-            # Use shared client
+            
             self.client = MongoDBClient.client
             self.database = self.client[database_name]
             self.database_name = database_name
-
         except Exception as e:
-            raise Exception(e, sys)
+            raise Exception(f"MongoDB connection failed: {e}")
 
-class TulireListingsScraper:
-    def __init__(self, max_listings=None, use_threading=True, max_workers=5, save_to_db=True):
+class EnhancedPlaywrightScrapingAgent:
+    """Enhanced Playwright-based scraping agent for complete Tulire data extraction"""
+    
+    def __init__(self, 
+                 headless: bool = True,
+                 max_listings: Optional[int] = None,
+                 delay_range: tuple = (2, 4),
+                 save_to_db: bool = True,
+                 batch_size: int = 10):
+        
+        self.headless = headless
+        self.max_listings = max_listings
+        self.delay_range = delay_range
+        self.save_to_db = save_to_db
+        self.batch_size = batch_size  # Save in batches to avoid memory issues
+        
+        # URLs and selectors
         self.base_url = "https://tulirealty.appfolio.com"
         self.listings_url = f"{self.base_url}/listings/listings"
-        self.max_listings = max_listings
-        self.use_threading = use_threading
-        self.max_workers = max_workers
-        self.save_to_db = save_to_db
         
-        # Setup logging first
-        self.logger = self._setup_logging()
+        # Browser instances
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
         
-        # Initialize MongoDB client if saving to database
+        # MongoDB setup
         self.mongo_client = None
         self.collection = None
         self.mongodb_connected = False
@@ -70,619 +107,835 @@ class TulireListingsScraper:
             try:
                 self.mongo_client = MongoDBClient()
                 self.collection = self.mongo_client.database['tulire_listings']
-                # Test the connection
-                self.collection.count_documents({})
+                self.collection.count_documents({})  # Test connection
                 self.mongodb_connected = True
-                self.logger.info("MongoDB connection established successfully")
             except Exception as e:
-                self.logger.error(f"Failed to connect to MongoDB: {e}")
+                print(f"MongoDB connection failed: {e}")
                 self.save_to_db = False
-                self.mongodb_connected = False
         
-        # Create scraped_data directory for backup files if needed
-        self.data_dir = "scraped_data"
-        os.makedirs(self.data_dir, exist_ok=True)
+        # Setup logging
+        self.logger = self._setup_logging()
         
-        # Setup session with realistic headers
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none'
-        })
+        # Enhanced selectors based on Tulire page structure
+        self.selectors = {
+            'listing_links': 'a[href*="/listings/detail/"]',
+            'title': [
+                'h1',
+                '.listing-title', 
+                '.property-title',
+                'title',
+                '[data-testid="listing-title"]'
+            ],
+            'address': [
+                '.address',
+                '.property-address',
+                '[data-testid="address"]',
+                '.listing-address',
+                'address'
+            ],
+            'price': [
+                '.rent-price',
+                '.price',
+                '[class*="price"]',
+                '[data-testid="price"]',
+                '.rental-price'
+            ],
+            'bed_bath_info': [
+                '.bed-bath',
+                '.property-details',
+                '.listing-details',
+                '[class*="bed"]',
+                '[class*="bath"]'
+            ],
+            'description': [
+                '.property-description',
+                '.listing-description',
+                '.description',
+                '[class*="description"]',
+                'p'
+            ],
+            'utilities_section': [
+                '.utilities',
+                '[class*="utilities"]',
+                'h3:has-text("Utilities"), h4:has-text("Utilities")',
+                'strong:has-text("Utilities")'
+            ],
+            'appliances_section': [
+                '.appliances',
+                '[class*="appliances"]',
+                'h3:has-text("Appliances"), h4:has-text("Appliances")',
+                'strong:has-text("Appliances")'
+            ],
+            'rental_terms_section': [
+                '.rental-terms',
+                '.lease-terms',
+                '[class*="terms"]',
+                'h3:has-text("Rental Terms"), h4:has-text("Rental Terms")'
+            ]
+        }
 
-    def _setup_logging(self):
+    def _setup_logging(self) -> logging.Logger:
         """Setup logging configuration"""
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler('scraper.log'),
+                logging.FileHandler('complete_tulire_scraper.log'),
                 logging.StreamHandler()
             ]
         )
         return logging.getLogger(__name__)
 
-    def save_to_mongodb(self, listings: List[Dict]) -> bool:
-        """Save listings directly to MongoDB"""
-        if not self.mongodb_connected:
-            self.logger.warning("MongoDB not connected. Skipping database save.")
-            return False
+    async def initialize_browser(self) -> None:
+        """Initialize Playwright browser with optimal settings"""
+        self.playwright = await async_playwright().start()
         
-        if not listings:
-            self.logger.warning("No listings to save to MongoDB")
-            return False
+        self.browser = await self.playwright.chromium.launch(
+            headless=self.headless,
+            args=[
+                '--no-sandbox',
+                '--disable-bgsync',
+                '--disable-extensions',
+                '--disable-default-apps',
+                '--no-first-run',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+            ]
+        )
+        
+        self.context = await self.browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US'
+        )
+        
+        self.logger.info("Browser initialized successfully")
+
+    async def close_browser(self) -> None:
+        """Clean up browser resources"""
+        if self.context:
+            await self.context.close()
+        if self.browser:
+            await self.browser.close()
+        if hasattr(self, 'playwright'):
+            await self.playwright.stop()
+
+    async def random_delay(self) -> None:
+        """Add random delay to appear more human-like"""
+        delay = random.uniform(*self.delay_range)
+        await asyncio.sleep(delay)
+
+    async def safe_get_text(self, page: Page, selectors: List[str], default: str = "") -> str:
+        """Safely get text from multiple possible selectors"""
+        for selector in selectors:
+            try:
+                element = await page.query_selector(selector)
+                if element:
+                    text = await element.text_content()
+                    if text and text.strip():
+                        return text.strip()
+            except Exception:
+                continue
+        return default
+
+    async def extract_listing_urls_with_pagination(self, page: Page) -> List[str]:
+        """Extract all listing URLs handling pagination"""
+        all_urls = []
+        page_num = 1
+        max_pages = 20  # Safety limit
         
         try:
-            # Add unique identifier and timestamp for each listing
-            processed_listings = []
-            for listing in listings:
-                listing_copy = listing.copy()
-                listing_copy['_id'] = f"tulire_{hash(listing['listing_url'])}"
-                listing_copy['source'] = 'tulire_realty'
-                listing_copy['last_updated'] = datetime.now()
-                processed_listings.append(listing_copy)
+            while page_num <= max_pages:
+                self.logger.info(f"Processing page {page_num}...")
+                
+                # Wait for listings to load
+                try:
+                    await page.wait_for_selector(self.selectors['listing_links'], timeout=15000)
+                except PlaywrightTimeoutError:
+                    self.logger.warning(f"No listings found on page {page_num}")
+                    break
+                
+                # Extract URLs from current page
+                links = await page.query_selector_all(self.selectors['listing_links'])
+                page_urls = []
+                
+                for link in links:
+                    href = await link.get_attribute('href')
+                    if href:
+                        full_url = urljoin(self.base_url, href)
+                        if full_url not in all_urls:  # Avoid duplicates
+                            page_urls.append(full_url)
+                            all_urls.append(full_url)
+                
+                self.logger.info(f"Found {len(page_urls)} new listings on page {page_num} (Total: {len(all_urls)})")
+                
+                if not page_urls:
+                    self.logger.info("No more listings found")
+                    break
+                
+                # Try to find and click next page button
+                next_button = None
+                next_selectors = [
+                    'a:has-text("Next")',
+                    'a[aria-label="Next"]',
+                    '.pagination a:last-child',
+                    'a[href*="page="]:last-child',
+                    '.next-page',
+                    '[class*="next"]'
+                ]
+                
+                for selector in next_selectors:
+                    try:
+                        next_button = await page.query_selector(selector)
+                        if next_button:
+                            is_disabled = await next_button.get_attribute('disabled')
+                            aria_disabled = await next_button.get_attribute('aria-disabled')
+                            
+                            if is_disabled == 'true' or aria_disabled == 'true':
+                                next_button = None
+                                continue
+                            break
+                    except Exception:
+                        continue
+                
+                if not next_button:
+                    self.logger.info("No more pages found")
+                    break
+                
+                # Click next page and wait
+                try:
+                    await next_button.click()
+                    await page.wait_for_load_state('networkidle')
+                    await self.random_delay()
+                    page_num += 1
+                except Exception as e:
+                    self.logger.warning(f"Could not navigate to next page: {e}")
+                    break
             
-            # Use upsert to avoid duplicates
-            bulk_operations = []
-            for listing in processed_listings:
-                bulk_operations.append(
-                    pymongo.UpdateOne(
-                        {'_id': listing['_id']},
-                        {'$set': listing},
-                        upsert=True
-                    )
-                )
-            
-            result = self.collection.bulk_write(bulk_operations)
-            
-            self.logger.info(f"MongoDB Save Results:")
-            self.logger.info(f"  - Inserted: {result.upserted_count}")
-            self.logger.info(f"  - Modified: {result.modified_count}")
-            self.logger.info(f"  - Matched: {result.matched_count}")
-            
-            return True
+            self.logger.info(f"Total listings found across all pages: {len(all_urls)}")
+            return all_urls
             
         except Exception as e:
-            self.logger.error(f"Error saving to MongoDB: {e}")
-            return False
+            self.logger.error(f"Error extracting listing URLs: {e}")
+            return all_urls
 
-    def get_mongodb_stats(self) -> Dict:
-        """Get statistics from MongoDB collection"""
-        if not self.mongodb_connected:
-            return {}
-        
-        try:
-            total_docs = self.collection.count_documents({})
-            tulire_docs = self.collection.count_documents({'source': 'tulire_realty'})
-            
-            # Get recent documents (last 24 hours)
-            yesterday = datetime.now() - timedelta(days=1)
-            recent_docs = self.collection.count_documents({
-                'source': 'tulire_realty',
-                'last_updated': {'$gte': yesterday}
-            })
-            
-            return {
-                'total_documents': total_docs,
-                'tulire_listings': tulire_docs,
-                'recent_updates': recent_docs
-            }
-        except Exception as e:
-            self.logger.error(f"Error getting MongoDB stats: {e}")
-            return {}
-
-    def extract_price(self, price_text: str) -> Optional[int]:
-        """Extract numeric price from price text"""
-        if not price_text:
+    def extract_price_from_text(self, text: str) -> Optional[int]:
+        """Extract price from text with multiple patterns"""
+        if not text:
             return None
         
-        # Remove $ and commas, extract numbers
-        price_match = re.search(r'\$?([\d,]+)', price_text.replace(',', ''))
-        if price_match:
-            return int(price_match.group(1).replace(',', ''))
+        patterns = [
+            r'\$(\d{1,3}(?:,\d{3})*)',  # $1,900
+            r'(\d{1,3}(?:,\d{3})*)\s*(?:/mo|per month)',  # 1900/mo
+            r'rent[:\s]*\$?(\d{1,3}(?:,\d{3})*)',  # Rent: $1900
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text.replace(',', ''), re.IGNORECASE)
+            if matches:
+                try:
+                    return int(matches[0].replace(',', ''))
+                except ValueError:
+                    continue
         return None
 
-    def extract_bed_bath_improved(self, text: str) -> Dict[str, Optional[float]]:
-        """Improved extraction of bedroom and bathroom counts from various formats"""
-        result = {'bedrooms': None, 'bathrooms': None}
+    def extract_bed_bath_from_text(self, text: str) -> Dict[str, Optional[float]]:
+        """Extract bedroom and bathroom counts from text"""
+        result = {'bedroom': None, 'bathroom': None}
         
         if not text:
             return result
         
-        # Convert to lowercase for easier matching
         text_lower = text.lower()
         
-        # Check for studio first
+        # Check for studio
         if 'studio' in text_lower:
-            result['bedrooms'] = 0
+            result['bedroom'] = 0
         
-        # Enhanced patterns for bedrooms
-        bedroom_patterns = [
-            r'(\d+)\s*bd(?:room)?s?',           # "2 bd", "2 bdrm", "2 bedrooms"
-            r'(\d+)\s*bedroom',                  # "2 bedroom"
-            r'(\d+)\s*br',                       # "2 br"
-            r'bed.*?(\d+)',                      # "bed 2" or similar
+        # Bedroom patterns
+        bed_patterns = [
+            r'(\d+)\s*(?:bd|bedroom|br)s?',
+            r'(\d+)\s*bed',
+            r'(\d+)\s*bd'
         ]
         
-        for pattern in bedroom_patterns:
-            bed_match = re.search(pattern, text_lower)
-            if bed_match and result['bedrooms'] is None:
-                result['bedrooms'] = int(bed_match.group(1))
+        for pattern in bed_patterns:
+            match = re.search(pattern, text_lower)
+            if match and result['bedroom'] is None:
+                result['bedroom'] = int(match.group(1))
                 break
         
-        # Enhanced patterns for bathrooms
-        bathroom_patterns = [
-            r'(\d+(?:\.\d+)?)\s*ba(?:th)?(?:room)?s?',  # "1.5 ba", "2 bath", "2 bathrooms"
-            r'(\d+(?:\.\d+)?)\s*bathroom',               # "1.5 bathroom"
-            r'bath.*?(\d+(?:\.\d+)?)',                   # "bath 1.5" or similar
+        # Bathroom patterns  
+        bath_patterns = [
+            r'(\d+(?:\.\d+)?)\s*(?:ba|bath|bathroom)s?',
+            r'(\d+(?:\.\d+)?)\s*bath',
+            r'(\d+(?:\.\d+)?)\s*ba'
         ]
         
-        for pattern in bathroom_patterns:
-            bath_match = re.search(pattern, text_lower)
-            if bath_match:
-                result['bathrooms'] = float(bath_match.group(1))
+        for pattern in bath_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                result['bathroom'] = float(match.group(1))
                 break
         
         return result
 
-    def extract_availability_date(self, text: str) -> str:
-        """Extract availability date with improved patterns"""
-        if not text:
-            return ""
+    async def extract_section_content(self, page: Page, section_name: str) -> List[str]:
+        """Extract content from a specific section (like utilities, appliances)"""
+        content = []
         
-        # Convert to string if it's not already
-        text = str(text)
-        
-        # Patterns for availability date
-        availability_patterns = [
-            r'available[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',          # "Available: 10/1/25", "Available 10/1/2025"
-            r'available[:\s]*([a-zA-Z]+\s+\d{1,2},?\s+\d{2,4})',        # "Available: October 1, 2025"
-            r'available[:\s]*([a-zA-Z]+\s+\d{1,2}(?:st|nd|rd|th)?)',    # "Available: October 1st"
-            r'available[:\s]*(\d{1,2}[/-]\d{1,2})',                     # "Available: 10/1"
-            r'available[:\s]*([a-zA-Z]+)',                               # "Available: October"
-            r'available[:\s]*([^<\n\r]+?)(?:\s*\||$)',                  # General available text
-        ]
-        
-        for pattern in availability_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                date_str = match.group(1).strip()
-                # Clean up common suffixes
-                date_str = re.sub(r'\s*\|.*$', '', date_str)
-                date_str = re.sub(r'\s*<.*$', '', date_str)
-                return date_str
-        
-        return ""
-
-    def extract_square_feet(self, sqft_text: str) -> Optional[int]:
-        """Extract square footage from text"""
-        if not sqft_text:
-            return None
+        try:
+            # Look for section headers
+            headers = await page.query_selector_all(f'h3:has-text("{section_name}"), h4:has-text("{section_name}"), strong:has-text("{section_name}")')
             
-        sqft_match = re.search(r'([\d,]+)', sqft_text.replace(',', ''))
-        if sqft_match:
-            return int(sqft_match.group(1).replace(',', ''))
+            for header in headers:
+                # Get the parent or next sibling elements that contain the list
+                parent = await header.query_selector('..')
+                if parent:
+                    # Look for list items or text content
+                    items = await parent.query_selector_all('li, p, div')
+                    for item in items:
+                        text = await item.text_content()
+                        if text and text.strip() and text.strip() != section_name:
+                            content.append(text.strip())
+                
+                # Also check next siblings
+                next_element = await page.evaluate('(element) => element.nextElementSibling', header)
+                if next_element:
+                    text = await page.evaluate('(element) => element.textContent', next_element)
+                    if text and text.strip():
+                        content.append(text.strip())
+        
+        except Exception as e:
+            self.logger.debug(f"Error extracting {section_name} section: {e}")
+        
+        return content
+
+    async def extract_rental_terms(self, page: Page) -> Dict[str, Any]:
+        """Extract rental terms information"""
+        rental_terms = {}
+        
+        try:
+            page_text = await page.text_content('body')
+            
+            # Extract rent amount
+            rent_match = re.search(r'rent[:\s]*\$?(\d{1,3}(?:,\d{3})*)', page_text, re.IGNORECASE)
+            if rent_match:
+                rental_terms['rent'] = f"${rent_match.group(1)}"
+            
+            # Extract application fee
+            app_fee_match = re.search(r'application\s+fee[:\s]*\$?(\d+)', page_text, re.IGNORECASE)
+            if app_fee_match:
+                rental_terms['application_fee'] = f"${app_fee_match.group(1)}"
+            
+            # Extract security deposit
+            deposit_match = re.search(r'security\s+deposit[:\s]*\$?([\d,]+)', page_text, re.IGNORECASE)
+            if deposit_match:
+                rental_terms['security_deposit'] = f"${deposit_match.group(1)}"
+            
+            # Extract availability
+            avail_match = re.search(r'available[:\s]*([^<\n\r]+)', page_text, re.IGNORECASE)
+            if avail_match:
+                rental_terms['availability'] = avail_match.group(1).strip()
+            
+            # Extract lease terms
+            lease_match = re.search(r'lease[:\s]*([^<\n\r.]+)', page_text, re.IGNORECASE)
+            if lease_match:
+                rental_terms['lease_terms'] = lease_match.group(1).strip()
+            
+        except Exception as e:
+            self.logger.debug(f"Error extracting rental terms: {e}")
+        
+        return rental_terms
+
+    async def check_pet_friendly(self, page: Page) -> Optional[str]:
+        """Check if the property is pet friendly"""
+        try:
+            page_text = await page.text_content('body')
+            page_text_lower = page_text.lower()
+            
+            # Positive indicators
+            pet_positive = [
+                'pets allowed',
+                'pet friendly', 
+                'pet-friendly',
+                'pets welcome',
+                'pets ok',
+                'pets: yes'
+            ]
+            
+            # Negative indicators
+            pet_negative = [
+                'no pets',
+                'pets not allowed',
+                'no pets allowed',
+                'pets: no'
+            ]
+            
+            for positive in pet_positive:
+                if positive in page_text_lower:
+                    return "Yes"
+            
+            for negative in pet_negative:
+                if negative in page_text_lower:
+                    return "No"
+            
+            # Look for pet policy section
+            if 'pet' in page_text_lower:
+                pet_match = re.search(r'pet[s]?[:\s]*([^<\n\r.]{1,50})', page_text_lower)
+                if pet_match:
+                    return pet_match.group(1).strip().title()
+            
+        except Exception as e:
+            self.logger.debug(f"Error checking pet policy: {e}")
+        
         return None
 
-    def clean_text(self, text: str) -> str:
-        """Clean and normalize text"""
-        if not text:
-            return ""
-        
-        # Remove extra whitespace and normalize
-        text = ' '.join(text.split())
-        return text.strip()
-
-    def debug_html_structure(self, soup):
-        """Debug function to understand the HTML structure"""
-        self.logger.info("Analyzing HTML structure...")
-        
-        # Look for common listing indicators
-        indicators = [
-            'rent', 'RENT', 'bedroom', 'bathroom', 'apartment', 'listing',
-            'price', 'available', 'bd', 'ba', 'sqft', 'square'
-        ]
-        
-        for indicator in indicators:
-            elements = soup.find_all(string=re.compile(indicator, re.IGNORECASE))
-            if elements:
-                self.logger.info(f"Found {len(elements)} elements containing '{indicator}'")
-
-    def find_listing_urls(self, soup) -> List[str]:
-        """Find individual listing detail URLs"""
-        urls = []
-        
-        # Look for links to listing detail pages
-        links = soup.find_all('a', href=re.compile(r'/listings/detail/'))
-        for link in links:
-            full_url = urljoin(self.base_url, link['href'])
-            if full_url not in urls:
-                urls.append(full_url)
-        
-        self.logger.info(f"Found {len(urls)} listing detail URLs")
-        return urls
-
-    def scrape_individual_listing(self, listing_url: str) -> Dict:
-        """Scrape an individual listing page with improved data extraction"""
+    async def scrape_listing_details(self, page: Page, listing_url: str) -> ListingData:
+        """Scrape detailed information from a single listing page with focus on specific keys"""
         try:
-            # Add small random delay to avoid overwhelming the server
-            time.sleep(random.uniform(0.5, 1.5))
+            await page.goto(listing_url, wait_until='networkidle', timeout=30000)
+            await self.random_delay()
             
-            response = self.session.get(listing_url, timeout=30)
-            response.raise_for_status()
+            # Initialize listing data
+            listing = ListingData(
+                listing_url=listing_url,
+                scraped_at=datetime.now().isoformat()
+            )
             
-            soup = BeautifulSoup(response.content, 'html.parser')
+            # Get page content for text-based extraction
+            page_text = await page.text_content('body')
             
-            listing_data = {
-                'title': '',
-                'rent_price': None,
-                'bedrooms': None,
-                'bathrooms': None,
-                'square_feet': None,
-                'address': '',
-                'availability_date': '',
-                'description': '',
-                'utilities_included': '',
-                'appliances': '',
-                'amenities': '',
-                'listing_url': listing_url,
-                'pet_policy': '',
-                'scraped_at': datetime.now().isoformat()
+            # Extract TITLE
+            listing.title = await self.safe_get_text(page, self.selectors['title'])
+            if not listing.title:
+                page_title = await page.title()
+                listing.title = re.sub(r'\s*-\s*.*$', '', page_title)  # Clean up title
+            
+            # Extract ADDRESS
+            listing.address = await self.safe_get_text(page, self.selectors['address'])
+            if not listing.address and page_text:
+                # Try to find address pattern in page text
+                address_patterns = [
+                    r'(\d+[^,\n]*(?:Avenue|Street|Boulevard|Road|Place|Lane|Drive|Way|Court|St|Ave|Blvd|Rd|Pl|Ln|Dr|Ct)[^,\n]*,\s*[^,\n]*(?:,\s*[A-Z]{2})?)',
+                    r'Management\s+(\d+[^,\n]*.+?(?:NJ|NY)\s*\d{5})',
+                ]
+                for pattern in address_patterns:
+                    match = re.search(pattern, page_text, re.IGNORECASE)
+                    if match:
+                        listing.address = match.group(1).strip()
+                        break
+            
+            # Extract PRICE
+            price_text = await self.safe_get_text(page, self.selectors['price'])
+            if not price_text and page_text:
+                price_match = re.search(r'\$[\d,]+', page_text)
+                if price_match:
+                    price_text = price_match.group()
+            listing.price = self.extract_price_from_text(price_text if price_text else page_text)
+            
+            # Extract BEDROOM and BATHROOM
+            bed_bath_text = await self.safe_get_text(page, self.selectors['bed_bath_info'])
+            if not bed_bath_text:
+                bed_bath_text = page_text
+            
+            bed_bath_info = self.extract_bed_bath_from_text(bed_bath_text)
+            listing.bedroom = bed_bath_info['bedroom']
+            listing.bathroom = bed_bath_info['bathroom']
+            
+            # Extract DESCRIPTION
+            description_text = await self.safe_get_text(page, self.selectors['description'])
+            if not description_text:
+                # Try to get the main description paragraph
+                paragraphs = await page.query_selector_all('p')
+                for p in paragraphs:
+                    text = await p.text_content()
+                    if text and len(text) > 100:  # Long paragraph likely to be description
+                        description_text = text
+                        break
+            listing.description = description_text
+            
+            # Extract RENTAL TERMS
+            listing.rental_terms = await self.extract_rental_terms(page)
+            
+            # Extract AMENITIES
+            utilities = await self.extract_section_content(page, "Utilities")
+            if not utilities and page_text:
+                # Extract utilities from general text
+                util_patterns = [
+                    r'heat\s*\([^)]*\)',
+                    r'water\s*\([^)]*\)', 
+                    r'electric\s*\([^)]*\)',
+                    r'gas\s*\([^)]*\)'
+                ]
+                for pattern in util_patterns:
+                    matches = re.findall(pattern, page_text, re.IGNORECASE)
+                    utilities.extend(matches)
+            
+            # Get appliances
+            appliances = await self.extract_section_content(page, "Appliances")
+            if not appliances and page_text:
+                # Common appliances to look for
+                appliance_keywords = ['refrigerator', 'stove', 'dishwasher', 'microwave', 'washer', 'dryer']
+                for keyword in appliance_keywords:
+                    if keyword in page_text.lower():
+                        appliances.append(keyword.title())
+            
+            listing.amenities = {
+                "appliances": list(set(appliances)),  # Remove duplicates
+                "utilities_included": list(set(utilities)),
+                "other_amenities": []
             }
             
-            # Get all text content for pattern matching
-            page_text = soup.get_text()
+            # Extract PET_FRIENDLY
+            listing.pet_friendly = await self.check_pet_friendly(page)
             
-            # Also get HTML for better structured extraction
-            page_html = str(soup)
+            return listing
             
-            # Extract title from page title or main heading
-            title_tag = soup.find('title')
-            if title_tag:
-                title_text = self.clean_text(title_tag.get_text())
-                # Remove common suffixes
-                title_text = re.sub(r'\s*-\s*Tulire Realty.*$', '', title_text, flags=re.IGNORECASE)
-                listing_data['title'] = title_text
-            
-            # Look for main heading if title is generic
-            h1_tag = soup.find('h1')
-            if h1_tag and (not listing_data['title'] or len(listing_data['title']) < 20):
-                listing_data['title'] = self.clean_text(h1_tag.get_text())
-            
-            # IMPROVED PRICE EXTRACTION
-            price_patterns = [
-                r'\$[\d,]+(?:\.\d{2})?(?:\s*/month|\s*/mo|/month|/mo)?',  # Standard price format with month
-                r'rent[:\s]*\$[\d,]+',                                    # "Rent: $1950"
-                r'price[:\s]*\$[\d,]+',                                   # "Price: $1950"
-                r'monthly[:\s]*\$[\d,]+',                                 # "Monthly: $1950"
-            ]
-            
-            for pattern in price_patterns:
-                price_match = re.search(pattern, page_text, re.IGNORECASE)
-                if price_match:
-                    listing_data['rent_price'] = self.extract_price(price_match.group())
-                    break
-            
-            # IMPROVED BEDROOM/BATHROOM EXTRACTION
-            # Extract from the full page text using improved function
-            bed_bath_data = self.extract_bed_bath_improved(page_text)
-            listing_data.update(bed_bath_data)
-            
-            # Also try to extract from common HTML patterns
-            # Look for specific elements that might contain bed/bath info
-            detail_elements = soup.find_all(['div', 'span', 'p'], class_=re.compile(r'detail|info|feature', re.I))
-            for element in detail_elements:
-                element_text = element.get_text()
-                bed_bath_data_element = self.extract_bed_bath_improved(element_text)
-                
-                # Update if we found better data
-                if bed_bath_data_element['bedrooms'] is not None and listing_data['bedrooms'] is None:
-                    listing_data['bedrooms'] = bed_bath_data_element['bedrooms']
-                if bed_bath_data_element['bathrooms'] is not None and listing_data['bathrooms'] is None:
-                    listing_data['bathrooms'] = bed_bath_data_element['bathrooms']
-            
-            # IMPROVED AVAILABILITY DATE EXTRACTION
-            listing_data['availability_date'] = self.extract_availability_date(page_text)
-            
-            # Also check for availability in HTML attributes or data attributes
-            avail_elements = soup.find_all(attrs={'data-available': True})
-            if avail_elements and not listing_data['availability_date']:
-                listing_data['availability_date'] = avail_elements[0].get('data-available', '')
-            
-            # Look for address - improved pattern
-            address_patterns = [
-                r'\d+[^,\n]*(?:street|avenue|boulevard|road|place|lane|drive|way|court|terrace|blvd|ave|st|rd|dr|ln|ct|pl)[^,\n]*,\s*[^,\n]*,\s*[A-Z]{2}\s*\d{5}',
-                r'address[:\s]*(.+?)(?:\n|<|$)',
-                r'location[:\s]*(.+?)(?:\n|<|$)',
-            ]
-            
-            for pattern in address_patterns:
-                address_match = re.search(pattern, page_text, re.IGNORECASE)
-                if address_match:
-                    if pattern.startswith(r'\d+'):  # Full address pattern
-                        address = address_match.group()
-                    else:  # Label: address pattern
-                        address = address_match.group(1)
-                    listing_data['address'] = self.clean_text(address)
-                    break
-            
-            # Look for square footage with improved patterns
-            sqft_patterns = [
-                r'(\d+[\d,]*)\s*(?:sq\.?\s*ft\.?|square\s*feet|sqft)',
-                r'square\s*feet?[:\s]*(\d+[\d,]*)',
-                r'size[:\s]*(\d+[\d,]*)\s*sq',
-            ]
-            
-            for pattern in sqft_patterns:
-                sqft_match = re.search(pattern, page_text, re.IGNORECASE)
-                if sqft_match:
-                    sqft_str = sqft_match.group(1).replace(',', '')
-                    try:
-                        listing_data['square_feet'] = int(sqft_str)
-                        break
-                    except ValueError:
-                        continue
-            
-            # Look for description in meta tags or main content
-            desc_tag = soup.find('meta', {'name': 'description'})
-            if desc_tag:
-                listing_data['description'] = self.clean_text(desc_tag.get('content', ''))
-            
-            # Look for amenities/features
-            amenities_keywords = ['amenities', 'features', 'includes']
-            for keyword in amenities_keywords:
-                amenities_match = re.search(f'{keyword}[:\s]*(.+?)(?:\n\n|\n[A-Z]|$)', page_text, re.IGNORECASE | re.DOTALL)
-                if amenities_match:
-                    listing_data['amenities'] = self.clean_text(amenities_match.group(1))
-                    break
-            
-            # Log extracted data for debugging
-            self.logger.debug(f"Extracted data for {listing_url}: "
-                            f"Price: {listing_data['rent_price']}, "
-                            f"Beds: {listing_data['bedrooms']}, "
-                            f"Baths: {listing_data['bathrooms']}, "
-                            f"Available: {listing_data['availability_date']}")
-            
-            return listing_data
-            
-        except requests.RequestException as e:
-            self.logger.error(f"HTTP error scraping {listing_url}: {e}")
-            return {}
         except Exception as e:
-            self.logger.error(f"Error scraping individual listing {listing_url}: {e}")
-            return {}
+            self.logger.error(f"Error scraping {listing_url}: {e}")
+            return ListingData(listing_url=listing_url, scraped_at=datetime.now().isoformat())
 
-    def scrape_individual_listing_threaded(self, listing_url: str) -> Dict:
-        """Wrapper for threaded scraping"""
-        return self.scrape_individual_listing(listing_url)
-
-    def scrape_listings(self) -> List[Dict]:
-        """Main method to scrape all listings"""
-        self.logger.info("Starting to scrape listings...")
+    async def save_to_mongodb_batch(self, listings: List[ListingData]) -> bool:
+        """Save listings to MongoDB in batch"""
+        if not self.mongodb_connected or not listings:
+            return False
         
         try:
-            response = self.session.get(self.listings_url, timeout=30)
-            response.raise_for_status()
+            bulk_operations = []
+            for listing in listings:
+                listing_dict = asdict(listing)
+                listing_dict['_id'] = f"tulire_{hash(listing.listing_url)}"
+                listing_dict['source'] = 'tulire_realty'
+                listing_dict['last_updated'] = datetime.now()
+                
+                bulk_operations.append(
+                    pymongo.UpdateOne(
+                        {'_id': listing_dict['_id']},
+                        {'$set': listing_dict},
+                        upsert=True
+                    )
+                )
             
-            self.logger.info(f"Successfully fetched page, status code: {response.status_code}")
+            if bulk_operations:
+                result = self.collection.bulk_write(bulk_operations)
+                
+                self.logger.info(f"MongoDB Batch Save - Inserted: {result.upserted_count}, Modified: {result.modified_count}")
+                return True
             
-            soup = BeautifulSoup(response.content, 'html.parser')
+        except Exception as e:
+            self.logger.error(f"Error saving batch to MongoDB: {e}")
+            return False
+        
+        return False
+
+    async def scrape_all_listings(self) -> List[ListingData]:
+        """Main method to scrape ALL listings with batched processing"""
+        try:
+            await self.initialize_browser()
+            page = await self.context.new_page()
             
-            # Debug HTML structure
-            self.debug_html_structure(soup)
+            self.logger.info("Navigating to listings page...")
+            await page.goto(self.listings_url, wait_until='networkidle')
             
-            # Find all listing URLs
-            listing_urls = self.find_listing_urls(soup)
+            # Extract ALL listing URLs with pagination
+            listing_urls = await self.extract_listing_urls_with_pagination(page)
             
             if not listing_urls:
-                self.logger.warning("No listing URLs found!")
+                self.logger.warning("No listing URLs found")
                 return []
             
             # Apply max_listings limit if specified
             if self.max_listings:
                 listing_urls = listing_urls[:self.max_listings]
-                self.logger.info(f"Limited to first {len(listing_urls)} listings")
-            
-            listings = []
-            
-            if self.use_threading and len(listing_urls) > 10:
-                # Use threading for faster scraping of multiple pages
-                self.logger.info(f"Using threaded scraping with {self.max_workers} workers for {len(listing_urls)} listings")
-                
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    # Submit all tasks
-                    future_to_url = {
-                        executor.submit(self.scrape_individual_listing_threaded, url): url 
-                        for url in listing_urls
-                    }
-                    
-                    # Process completed tasks
-                    for i, future in enumerate(as_completed(future_to_url), 1):
-                        url = future_to_url[future]
-                        try:
-                            listing_data = future.result()
-                            if listing_data:
-                                listings.append(listing_data)
-                                self.logger.info(f"Scraped listing {i}/{len(listing_urls)}: {listing_data.get('title', 'No title')[:50]}...")
-                            else:
-                                self.logger.warning(f"Failed to scrape {url}")
-                        except Exception as e:
-                            self.logger.error(f"Error processing {url}: {e}")
-                        
-                        # Progress update every 10 listings
-                        if i % 10 == 0:
-                            self.logger.info(f"Progress: {i}/{len(listing_urls)} listings processed")
-            
+                self.logger.info(f"Limited to {len(listing_urls)} listings")
             else:
-                # Sequential scraping
-                self.logger.info(f"Using sequential scraping for {len(listing_urls)} listings")
-                for i, url in enumerate(listing_urls, 1):
-                    try:
-                        listing_data = self.scrape_individual_listing(url)
-                        if listing_data:
-                            listings.append(listing_data)
-                            self.logger.info(f"Scraped listing {i}/{len(listing_urls)}: {listing_data.get('title', 'No title')[:50]}...")
-                        else:
-                            self.logger.warning(f"Failed to scrape {url}")
-                        
-                        # Progress update every 10 listings
-                        if i % 10 == 0:
-                            self.logger.info(f"Progress: {i}/{len(listing_urls)} listings processed")
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error scraping {url}: {e}")
+                self.logger.info(f"Processing ALL {len(listing_urls)} listings")
             
-            self.logger.info(f"Successfully scraped {len(listings)} out of {len(listing_urls)} listings")
+            # Scrape listings with batch processing
+            all_listings = []
+            current_batch = []
             
-            # Save to MongoDB after scraping - with careful error handling
-            if self.mongodb_connected and len(listings) > 0:
+            for i, url in enumerate(listing_urls, 1):
                 try:
-                    self.logger.info("Attempting to save data to MongoDB...")
-                    success = self.save_to_mongodb(listings)
-                    if success:
-                        self.logger.info("Successfully saved data to MongoDB")
+                    self.logger.info(f"Scraping listing {i}/{len(listing_urls)}: {url}")
+                    listing = await self.scrape_listing_details(page, url)
+                    
+                    # Only add if we got the compulsory data
+                    if listing.title and listing.address:
+                        current_batch.append(listing)
+                        all_listings.append(listing)
+                        
+                        # Save batch when it reaches batch_size
+                        if len(current_batch) >= self.batch_size:
+                            if self.save_to_db:
+                                await self.save_to_mongodb_batch(current_batch)
+                            current_batch = []  # Reset batch
                     else:
-                        self.logger.warning("Failed to save data to MongoDB")
+                        self.logger.warning(f"Missing compulsory data for {url}")
+                    
+                    await self.random_delay()
+                    
+                    # Progress update every 10 listings
+                    if i % 10 == 0:
+                        self.logger.info(f"Progress: {i}/{len(listing_urls)} completed ({len(all_listings)} valid)")
+                    
                 except Exception as e:
-                    self.logger.error(f"Error during MongoDB save operation: {e}")
+                    self.logger.error(f"Error scraping listing {url}: {e}")
+                    continue
             
-            return listings
+            # Save remaining listings in final batch
+            if current_batch and self.save_to_db:
+                await self.save_to_mongodb_batch(current_batch)
             
-        except requests.RequestException as e:
-            self.logger.error(f"Error fetching main page: {e}")
-            return []
+            await page.close()
+            
+            self.logger.info(f"Successfully scraped {len(all_listings)} listings with complete data")
+            return all_listings
+            
         except Exception as e:
-            self.logger.error(f"Unexpected error in scrape_listings: {e}")
-            import traceback
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            self.logger.error(f"Error in scrape_all_listings: {e}")
             return []
-
-    def save_to_json(self, listings: List[Dict], filename: str = None) -> str:
-        """Save listings to JSON file as backup"""
-        if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"tulire_listings_backup_{timestamp}.json"
         
-        filepath = os.path.join(self.data_dir, filename)
+        finally:
+            await self.close_browser()
+
+    def save_to_json(self, listings: List[ListingData], filename: str = None) -> str:
+        """Save listings to JSON file"""
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"complete_tulire_listings_{timestamp}.json"
+        
+        os.makedirs("scraped_data", exist_ok=True)
+        filepath = os.path.join("scraped_data", filename)
         
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(listings, f, indent=2, ensure_ascii=False, default=str)
+            listings_dict = [asdict(listing) for listing in listings]
             
-            self.logger.info(f"Backup saved: {len(listings)} listings to {filepath}")
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(listings_dict, f, indent=2, ensure_ascii=False, default=str)
+            
+            self.logger.info(f"Saved {len(listings)} listings to {filepath}")
             return filepath
             
         except Exception as e:
-            self.logger.error(f"Error saving backup JSON: {e}")
+            self.logger.error(f"Error saving to JSON: {e}")
             return ""
 
-    def get_stats(self, listings: List[Dict]) -> Dict:
-        """Get statistics about scraped listings"""
+    def generate_summary_report(self, listings: List[ListingData]) -> Dict[str, Any]:
+        """Generate a comprehensive summary report"""
         if not listings:
             return {}
         
-        stats = {
-            'total_listings': len(listings),
-            'with_price': len([l for l in listings if l.get('rent_price')]),
-            'with_bedrooms': len([l for l in listings if l.get('bedrooms') is not None]),
-            'with_bathrooms': len([l for l in listings if l.get('bathrooms')]),
-            'with_address': len([l for l in listings if l.get('address')]),
-            'with_square_feet': len([l for l in listings if l.get('square_feet')]),
-            'with_availability': len([l for l in listings if l.get('availability_date')]),
-            'with_description': len([l for l in listings if l.get('description')]),
+        total = len(listings)
+        
+        # Price analysis
+        prices = [l.price for l in listings if l.price]
+        price_stats = {}
+        if prices:
+            price_stats = {
+                'min': min(prices),
+                'max': max(prices),
+                'avg': sum(prices) // len(prices),
+                'median': sorted(prices)[len(prices)//2]
+            }
+        
+        # Bedroom analysis
+        bedrooms = [l.bedroom for l in listings if l.bedroom is not None]
+        bedroom_counts = {}
+        for bed in bedrooms:
+            bedroom_counts[bed] = bedroom_counts.get(bed, 0) + 1
+        
+        # Pet friendly analysis
+        pet_friendly_count = len([l for l in listings if l.pet_friendly == "Yes"])
+        pet_not_allowed = len([l for l in listings if l.pet_friendly == "No"])
+        pet_unknown = total - pet_friendly_count - pet_not_allowed
+        
+        return {
+            'total_listings': total,
+            'data_completeness': {
+                'title': len([l for l in listings if l.title]) / total * 100,
+                'address': len([l for l in listings if l.address]) / total * 100,
+                'price': len([l for l in listings if l.price]) / total * 100,
+                'bedroom': len([l for l in listings if l.bedroom is not None]) / total * 100,
+                'bathroom': len([l for l in listings if l.bathroom is not None]) / total * 100,
+                'description': len([l for l in listings if l.description]) / total * 100,
+                'rental_terms': len([l for l in listings if l.rental_terms]) / total * 100,
+                'pet_info': len([l for l in listings if l.pet_friendly]) / total * 100,
+            },
+            'price_analysis': price_stats,
+            'bedroom_distribution': bedroom_counts,
+            'pet_policy': {
+                'allowed': pet_friendly_count,
+                'not_allowed': pet_not_allowed,
+                'unknown': pet_unknown
+            }
         }
-        
-        if stats['with_price'] > 0:
-            prices = [l['rent_price'] for l in listings if l.get('rent_price')]
-            stats['price_range'] = f"${min(prices):,} - ${max(prices):,}"
-            stats['avg_price'] = f"${sum(prices) // len(prices):,}"
-        
-        return stats
 
-def main():
-    """Main execution function"""
-    print("🏠 Starting MongoDB-Integrated Tulire Listings Scraper...")
-    print("=" * 60)
+async def main():
+    """Main execution function for complete scraping"""
+    print("🏠 Starting COMPLETE Tulire Listings Scraping Agent...")
+    print("Target: ALL available listings with detailed data extraction")
+    print("Focus: title, address, price, bedroom, bathroom, description, rental_terms, amenities, pet_friendly")
+    print("=" * 100)
     
-    # Configuration options
-    MAX_LISTINGS = None  # Set to None to scrape all, or a number like 20 for testing
-    USE_THREADING = True  # Set to False for sequential scraping
-    MAX_WORKERS = 5      # Number of concurrent threads
-    SAVE_TO_DB = True    # Save directly to MongoDB
+    # Configuration for COMPLETE scraping
+    MAX_LISTINGS = None  # Set to None for ALL listings, or set a number for testing
+    HEADLESS = True      # Set to False to see browser in action  
+    SAVE_TO_DB = True    # Save to MongoDB
+    BATCH_SIZE = 20      # Process and save in batches of 20
+    
+    print(f"Configuration:")
+    print(f"  - Max Listings: {'ALL AVAILABLE' if MAX_LISTINGS is None else MAX_LISTINGS}")
+    print(f"  - Headless Mode: {HEADLESS}")
+    print(f"  - Save to MongoDB: {SAVE_TO_DB}")
+    print(f"  - Batch Size: {BATCH_SIZE}")
+    print("-" * 100)
+    
+    agent = EnhancedPlaywrightScrapingAgent(
+        headless=HEADLESS,
+        max_listings=MAX_LISTINGS,
+        save_to_db=SAVE_TO_DB,
+        delay_range=(1.5, 3.5),  # Respectful delay range
+        batch_size=BATCH_SIZE
+    )
     
     try:
-        scraper = TulireListingsScraper(
-            max_listings=MAX_LISTINGS, 
-            use_threading=USE_THREADING,
-            max_workers=MAX_WORKERS,
-            save_to_db=SAVE_TO_DB
-        )
+        start_time = datetime.now()
+        print(f"🚀 Starting scrape at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Scrape listings (will automatically save to MongoDB)
-        listings = scraper.scrape_listings()
+        # Scrape all listings
+        listings = await agent.scrape_all_listings()
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
         
         if not listings:
-            print("❌ No listings found. Check scraper.log for details")
+            print("❌ No listings found. Check complete_tulire_scraper.log for details")
             return
         
-        # Display statistics
-        stats = scraper.get_stats(listings)
-        print(f"\n✅ Successfully scraped {len(listings)} listings")
-        print("\n📊 Scraping Statistics:")
-        print("-" * 40)
-        for key, value in stats.items():
-            if key != 'total_listings':
-                print(f"{key.replace('_', ' ').title()}: {value}")
+        # Display results
+        print(f"\n✅ SCRAPING COMPLETED SUCCESSFULLY!")
+        print("=" * 100)
+        print(f"⏱️  Total Time: {duration}")
+        print(f"📊 Total Listings Scraped: {len(listings)}")
+        print(f"📈 Average Time per Listing: {duration.total_seconds() / len(listings):.2f} seconds")
         
-        # Display MongoDB statistics
-        if scraper.mongodb_connected:
-            try:
-                mongo_stats = scraper.get_mongodb_stats()
-                if mongo_stats:
-                    print(f"\n🗄️  MongoDB Statistics:")
-                    print("-" * 40)
-                    for key, value in mongo_stats.items():
-                        print(f"{key.replace('_', ' ').title()}: {value}")
-            except Exception as e:
-                print(f"Error getting MongoDB stats: {e}")
+        # Generate and save comprehensive report
+        summary = agent.generate_summary_report(listings)
         
-        # Display sample listing
-        print(f"\n📋 Sample listing data:")
-        print("-" * 40)
-        if listings:
-            sample = listings[0]
-            for key, value in sample.items():
-                if value and key not in ['scraped_at', '_id', 'source', 'last_updated']:
-                    display_value = str(value)[:80] + "..." if len(str(value)) > 80 else str(value)
-                    print(f"{key}: {display_value}")
-            print("-" * 40)
+        # Save data to files
+        json_file = agent.save_to_json(listings)
         
-        # Save backup file
-        backup_file = scraper.save_to_json(listings)
+        # Display comprehensive statistics
+        print(f"\n📋 COMPREHENSIVE SUMMARY REPORT:")
+        print("-" * 100)
         
-        print(f"\n💾 Data Storage:")
-        if scraper.mongodb_connected:
-            print(f"   🗄️  Primary: MongoDB (rental_database.tulire_listings)")
-        if backup_file:
-            print(f"   📄 Backup: {os.path.basename(backup_file)}")
+        if summary:
+            print(f"Total Listings: {summary['total_listings']}")
+            
+            print(f"\n📊 Data Completeness:")
+            for field, percentage in summary['data_completeness'].items():
+                bar_length = int(percentage / 5)  # Scale to 20 chars max
+                bar = "█" * bar_length + "░" * (20 - bar_length)
+                print(f"  {field.replace('_', ' ').title():15} [{bar}] {percentage:.1f}%")
+            
+            if summary.get('price_analysis'):
+                price = summary['price_analysis']
+                print(f"\n💰 Price Analysis:")
+                print(f"  Minimum Rent: ${price['min']:,}")
+                print(f"  Maximum Rent: ${price['max']:,}")
+                print(f"  Average Rent: ${price['avg']:,}")
+                print(f"  Median Rent:  ${price['median']:,}")
+            
+            if summary.get('bedroom_distribution'):
+                print(f"\n🛏️  Bedroom Distribution:")
+                for bedrooms, count in sorted(summary['bedroom_distribution'].items()):
+                    bedroom_text = "Studio" if bedrooms == 0 else f"{bedrooms} BR"
+                    percentage = (count / summary['total_listings']) * 100
+                    print(f"  {bedroom_text:10} {count:3d} listings ({percentage:.1f}%)")
+            
+            pet_policy = summary.get('pet_policy', {})
+            print(f"\n🐕 Pet Policy Distribution:")
+            print(f"  Pets Allowed:     {pet_policy.get('allowed', 0):3d} listings")
+            print(f"  Pets Not Allowed: {pet_policy.get('not_allowed', 0):3d} listings")  
+            print(f"  Policy Unknown:   {pet_policy.get('unknown', 0):3d} listings")
         
-        print(f"\n✨ Scraping completed!")
-        print(f"📈 Success rate: {len(listings)}/{stats.get('total_listings', 'unknown')} listings")
-        if scraper.mongodb_connected:
-            print(f"🗄️  All data is now stored in MongoDB!")
-    
+        # Display sample listings
+        print(f"\n📝 SAMPLE LISTINGS:")
+        print("-" * 100)
+        
+        # Show 3 sample listings with complete data
+        complete_listings = [l for l in listings if l.title and l.address and l.price]
+        sample_count = min(3, len(complete_listings))
+        
+        for i in range(sample_count):
+            listing = complete_listings[i]
+            print(f"\n🏠 Sample Listing #{i+1}:")
+            print(f"   Title: {listing.title}")
+            print(f"   Address: {listing.address}")
+            print(f"   Price: ${listing.price:,}" if listing.price else "   Price: Not specified")
+            print(f"   Bedrooms: {listing.bedroom}")
+            print(f"   Bathrooms: {listing.bathroom}")
+            print(f"   Pet Friendly: {listing.pet_friendly or 'Not specified'}")
+            
+            if listing.rental_terms:
+                terms_str = ", ".join([f"{k}: {v}" for k, v in listing.rental_terms.items()])
+                print(f"   Rental Terms: {terms_str}")
+            
+            if listing.amenities and listing.amenities.get('appliances'):
+                appliances_str = ", ".join(listing.amenities['appliances'][:3])
+                print(f"   Appliances: {appliances_str}{'...' if len(listing.amenities['appliances']) > 3 else ''}")
+            
+            if listing.description:
+                desc_preview = listing.description[:100] + "..." if len(listing.description) > 100 else listing.description
+                print(f"   Description: {desc_preview}")
+        
+        # Save summary report
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        summary_file = f"scraped_data/tulire_summary_report_{timestamp}.json"
+        try:
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
+            print(f"\n💾 Files Saved:")
+            print(f"   📊 Summary Report: {os.path.basename(summary_file)}")
+        except Exception as e:
+            print(f"   ⚠️  Could not save summary report: {e}")
+        
+        print(f"   🗄️  MongoDB: rental_database.tulire_listings (batched saves)")
+        if json_file:
+            print(f"   📄 Complete Data: {os.path.basename(json_file)}")
+        
+        # Final success message
+        print(f"\n🎯 COMPLETE TULIRE SCRAPING FINISHED!")
+        print(f"✨ Successfully processed {len(listings)} listings in {duration}")
+        print(f"🔍 Check the log file 'complete_tulire_scraper.log' for detailed information")
+        
+        # Performance metrics
+        if len(listings) > 50:
+            print(f"\n📈 PERFORMANCE METRICS:")
+            print(f"   ⚡ Listings per minute: {(len(listings) / duration.total_seconds()) * 60:.1f}")
+            print(f"   🎯 Success rate: {(len([l for l in listings if l.title and l.address]) / len(listings)) * 100:.1f}%")
+        
+    except KeyboardInterrupt:
+        print(f"\n⏹️  Scraping interrupted by user")
+        print(f"📊 Partial results may be available in MongoDB and log files")
+        
     except Exception as e:
-        print(f"❌ Error in main execution: {e}")
+        print(f"❌ Fatal Error: {e}")
         import traceback
-        print(f"Traceback: {traceback.format_exc()}")
+        print(f"🔍 Traceback: {traceback.format_exc()}")
+        print(f"💡 Check complete_tulire_scraper.log for more details")
 
 if __name__ == "__main__":
-    main()
+    # Required packages:
+    # pip install playwright pymongo python-dotenv certifi
+    # playwright install chromium
+    
+    print("🔧 Required Setup:")
+    print("   pip install playwright pymongo python-dotenv certifi")
+    print("   playwright install chromium")
+    print("   Set MONGODB_URL_KEY in your .env file")
+    print()
+    
+    asyncio.run(main())
