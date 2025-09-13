@@ -1,7 +1,7 @@
 import streamlit as st
 from langchain.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
-from query_executor import RentalQueryExecutor  # <-- your class file
+from retrieval.mgdb_filter import MongoDBFilter  
 import os
 from dotenv import load_dotenv
 
@@ -28,13 +28,12 @@ Format them into a natural, friendly response highlighting:
 - Rent Price
 - Bedrooms & Bathrooms
 - Availability date (if present)
-- Any other descriptive detail other then mentioned above.                                                   
+- Any other descriptive detail other then mentioned above in a concise format.
 
 If no listings are found, politely explain that and suggest trying another query.
 """)
 
-# Initialize executor
-executor = RentalQueryExecutor()
+executor = MongoDBFilter()
 
 
 def run_chatbot():

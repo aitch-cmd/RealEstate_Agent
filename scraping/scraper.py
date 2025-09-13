@@ -1,6 +1,8 @@
 """
 Enhanced Intelligent Playwright-Based Scraping Agent for Complete Tulire Listings
 Scrapes ALL available listings with focus on specific keys: title, address, price, bedroom, bathroom, description, rental terms, amenities, pet_friendly
+NOW SUPPORTS: Complete data overwrite option for fresh scraping runs
+FIXED: Unicode encoding errors and timeout issues
 """
 
 import asyncio
@@ -15,15 +17,12 @@ import random
 import os
 import sys
 from dataclasses import dataclass, asdict
-
-# Playwright imports
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-# MongoDB imports
 import pymongo
 import certifi
 from dotenv import load_dotenv
+from db.connection import MongoDBClient
 
 # Load environment variables
 load_dotenv()
@@ -57,23 +56,6 @@ class ListingData:
                 "other_amenities": []
             }
 
-class MongoDBClient:
-    """MongoDB client for storing scraped data"""
-    client = None
-
-    def __init__(self, database_name: str = DATABASE_NAME) -> None:
-        try:
-            if MongoDBClient.client is None:
-                if MONGODB_URL is None:
-                    raise Exception("Environment variable 'MONGODB_URL_KEY' is not set.")
-                MongoDBClient.client = pymongo.MongoClient(MONGODB_URL, tlsCAFile=ca)
-            
-            self.client = MongoDBClient.client
-            self.database = self.client[database_name]
-            self.database_name = database_name
-        except Exception as e:
-            raise Exception(f"MongoDB connection failed: {e}")
-
 class EnhancedPlaywrightScrapingAgent:
     """Enhanced Playwright-based scraping agent for complete Tulire data extraction"""
     
@@ -82,13 +64,15 @@ class EnhancedPlaywrightScrapingAgent:
                  max_listings: Optional[int] = None,
                  delay_range: tuple = (2, 4),
                  save_to_db: bool = True,
-                 batch_size: int = 10):
+                 batch_size: int = 10,
+                 overwrite_data: bool = False):
         
         self.headless = headless
         self.max_listings = max_listings
         self.delay_range = delay_range
         self.save_to_db = save_to_db
-        self.batch_size = batch_size  # Save in batches to avoid memory issues
+        self.batch_size = batch_size
+        self.overwrite_data = overwrite_data
         
         # URLs and selectors
         self.base_url = "https://tulirealty.appfolio.com"
@@ -102,18 +86,19 @@ class EnhancedPlaywrightScrapingAgent:
         self.mongo_client = None
         self.collection = None
         self.mongodb_connected = False
+        self.data_cleared = False
         
         if self.save_to_db:
             try:
                 self.mongo_client = MongoDBClient()
                 self.collection = self.mongo_client.database['tulire_listings']
-                self.collection.count_documents({})  # Test connection
+                self.collection.count_documents({})
                 self.mongodb_connected = True
             except Exception as e:
                 print(f"MongoDB connection failed: {e}")
                 self.save_to_db = False
         
-        # Setup logging
+        # Setup logging with UTF-8 encoding fix
         self.logger = self._setup_logging()
         
         # Enhanced selectors based on Tulire page structure
@@ -175,19 +160,80 @@ class EnhancedPlaywrightScrapingAgent:
         }
 
     def _setup_logging(self) -> logging.Logger:
-        """Setup logging configuration"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('complete_tulire_scraper.log'),
-                logging.StreamHandler()
-            ]
-        )
-        return logging.getLogger(__name__)
+        """Setup logging configuration with UTF-8 encoding fix for Windows"""
+        # Ensure logs directory exists
+        log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+        os.makedirs(log_dir, exist_ok=True)
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"complete_tulire_scraper_{timestamp}.log"
+        log_path = os.path.join(log_dir, log_filename)
+
+        # Create a custom handler that handles Unicode properly
+        class SafeStreamHandler(logging.StreamHandler):
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    # Remove emojis and special Unicode characters for console output
+                    safe_msg = re.sub(r'[^\x00-\x7F]+', '', msg)
+                    stream = self.stream
+                    stream.write(safe_msg + self.terminator)
+                    self.flush()
+                except Exception:
+                    self.handleError(record)
+
+        # Configure logging with safe handlers
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.INFO)
+        
+        # Clear any existing handlers
+        logger.handlers.clear()
+        
+        # File handler with UTF-8 encoding
+        file_handler = logging.FileHandler(log_path, encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        
+        # Safe console handler
+        console_handler = SafeStreamHandler()
+        console_handler.setLevel(logging.INFO)
+        
+        # Formatter
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+        
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        
+        return logger
+
+    async def clear_existing_data(self) -> bool:
+        """Clear all existing Tulire data from MongoDB collection"""
+        if not self.mongodb_connected or self.data_cleared:
+            return False
+        
+        try:
+            current_count = self.collection.count_documents({})
+            
+            if current_count > 0:
+                self.logger.info(f"OVERWRITE MODE: Clearing {current_count} existing listings from MongoDB...")
+                
+                result = self.collection.delete_many({})
+                
+                self.logger.info(f"Successfully cleared {result.deleted_count} existing listings")
+                self.data_cleared = True
+                return True
+            else:
+                self.logger.info("No existing data found in MongoDB")
+                self.data_cleared = True
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"Error clearing existing data: {e}")
+            return False
+    
     async def initialize_browser(self) -> None:
-        """Initialize Playwright browser with optimal settings"""
+        """Initialize Playwright browser with enhanced settings for difficult sites"""
         self.playwright = await async_playwright().start()
         
         self.browser = await self.playwright.chromium.launch(
@@ -199,14 +245,24 @@ class EnhancedPlaywrightScrapingAgent:
                 '--disable-default-apps',
                 '--no-first-run',
                 '--disable-dev-shm-usage',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor'
             ]
         )
         
         self.context = await self.browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
-            locale='en-US'
+            locale='en-US',
+            extra_http_headers={
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
         )
         
         self.logger.info("Browser initialized successfully")
@@ -225,6 +281,48 @@ class EnhancedPlaywrightScrapingAgent:
         delay = random.uniform(*self.delay_range)
         await asyncio.sleep(delay)
 
+    async def safe_navigate_to_page(self, page: Page, url: str, max_retries: int = 3) -> bool:
+        """Safely navigate to a page with retries and different wait strategies"""
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"Attempt {attempt + 1}/{max_retries}: Navigating to {url}")
+                
+                # Try different wait strategies
+                wait_strategies = ['networkidle', 'load', 'domcontentloaded']
+                wait_strategy = wait_strategies[attempt % len(wait_strategies)]
+                
+                # Increase timeout progressively
+                timeout = 30000 + (attempt * 15000)  # 30s, 45s, 60s
+                
+                await page.goto(url, wait_until=wait_strategy, timeout=timeout)
+                
+                # Wait a bit more and check if page loaded
+                await asyncio.sleep(2)
+                
+                # Check if we can find some content
+                title = await page.title()
+                if title and len(title) > 0:
+                    self.logger.info(f"Successfully navigated to page: {title}")
+                    return True
+                
+            except PlaywrightTimeoutError as e:
+                self.logger.warning(f"Timeout on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)  # Wait before retry
+                    continue
+                else:
+                    self.logger.error(f"Failed to navigate to {url} after {max_retries} attempts")
+                    return False
+            except Exception as e:
+                self.logger.error(f"Navigation error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    return False
+        
+        return False
+
     async def safe_get_text(self, page: Page, selectors: List[str], default: str = "") -> str:
         """Safely get text from multiple possible selectors"""
         for selector in selectors:
@@ -239,20 +337,36 @@ class EnhancedPlaywrightScrapingAgent:
         return default
 
     async def extract_listing_urls_with_pagination(self, page: Page) -> List[str]:
-        """Extract all listing URLs handling pagination"""
+        """Extract all listing URLs handling pagination with improved error handling"""
         all_urls = []
         page_num = 1
-        max_pages = 20  # Safety limit
+        max_pages = 20
         
         try:
             while page_num <= max_pages:
                 self.logger.info(f"Processing page {page_num}...")
                 
-                # Wait for listings to load
-                try:
-                    await page.wait_for_selector(self.selectors['listing_links'], timeout=15000)
-                except PlaywrightTimeoutError:
-                    self.logger.warning(f"No listings found on page {page_num}")
+                # Wait for listings to load with multiple attempts
+                listings_found = False
+                wait_attempts = 0
+                max_wait_attempts = 3
+                
+                while not listings_found and wait_attempts < max_wait_attempts:
+                    try:
+                        await page.wait_for_selector(self.selectors['listing_links'], timeout=20000)
+                        listings_found = True
+                    except PlaywrightTimeoutError:
+                        wait_attempts += 1
+                        self.logger.warning(f"Waiting for listings, attempt {wait_attempts}/{max_wait_attempts}")
+                        if wait_attempts < max_wait_attempts:
+                            await asyncio.sleep(5)
+                            # Try to refresh the page
+                            await page.reload()
+                            await asyncio.sleep(3)
+                        continue
+                
+                if not listings_found:
+                    self.logger.warning(f"No listings found on page {page_num} after {max_wait_attempts} attempts")
                     break
                 
                 # Extract URLs from current page
@@ -263,7 +377,7 @@ class EnhancedPlaywrightScrapingAgent:
                     href = await link.get_attribute('href')
                     if href:
                         full_url = urljoin(self.base_url, href)
-                        if full_url not in all_urls:  # Avoid duplicates
+                        if full_url not in all_urls:
                             page_urls.append(full_url)
                             all_urls.append(full_url)
                 
@@ -289,7 +403,7 @@ class EnhancedPlaywrightScrapingAgent:
                         next_button = await page.query_selector(selector)
                         if next_button:
                             is_disabled = await next_button.get_attribute('disabled')
-                            aria_disabled = await next_button.get_attribute('aria-disabled')
+                            aria_disabled = await next_button.get_attribute('aria_disabled')
                             
                             if is_disabled == 'true' or aria_disabled == 'true':
                                 next_button = None
@@ -305,7 +419,7 @@ class EnhancedPlaywrightScrapingAgent:
                 # Click next page and wait
                 try:
                     await next_button.click()
-                    await page.wait_for_load_state('networkidle')
+                    await page.wait_for_load_state('networkidle', timeout=30000)
                     await self.random_delay()
                     page_num += 1
                 except Exception as e:
@@ -325,9 +439,9 @@ class EnhancedPlaywrightScrapingAgent:
             return None
         
         patterns = [
-            r'\$(\d{1,3}(?:,\d{3})*)',  # $1,900
-            r'(\d{1,3}(?:,\d{3})*)\s*(?:/mo|per month)',  # 1900/mo
-            r'rent[:\s]*\$?(\d{1,3}(?:,\d{3})*)',  # Rent: $1900
+            r'\$(\d{1,3}(?:,\d{3})*)',
+            r'(\d{1,3}(?:,\d{3})*)\s*(?:/mo|per month)',
+            r'rent[:\s]*\$?(\d{1,3}(?:,\d{3})*)',
         ]
         
         for pattern in patterns:
@@ -348,11 +462,9 @@ class EnhancedPlaywrightScrapingAgent:
         
         text_lower = text.lower()
         
-        # Check for studio
         if 'studio' in text_lower:
             result['bedroom'] = 0
         
-        # Bedroom patterns
         bed_patterns = [
             r'(\d+)\s*(?:bd|bedroom|br)s?',
             r'(\d+)\s*bed',
@@ -365,7 +477,6 @@ class EnhancedPlaywrightScrapingAgent:
                 result['bedroom'] = int(match.group(1))
                 break
         
-        # Bathroom patterns  
         bath_patterns = [
             r'(\d+(?:\.\d+)?)\s*(?:ba|bath|bathroom)s?',
             r'(\d+(?:\.\d+)?)\s*bath',
@@ -381,25 +492,21 @@ class EnhancedPlaywrightScrapingAgent:
         return result
 
     async def extract_section_content(self, page: Page, section_name: str) -> List[str]:
-        """Extract content from a specific section (like utilities, appliances)"""
+        """Extract content from a specific section"""
         content = []
         
         try:
-            # Look for section headers
             headers = await page.query_selector_all(f'h3:has-text("{section_name}"), h4:has-text("{section_name}"), strong:has-text("{section_name}")')
             
             for header in headers:
-                # Get the parent or next sibling elements that contain the list
                 parent = await header.query_selector('..')
                 if parent:
-                    # Look for list items or text content
                     items = await parent.query_selector_all('li, p, div')
                     for item in items:
                         text = await item.text_content()
                         if text and text.strip() and text.strip() != section_name:
                             content.append(text.strip())
                 
-                # Also check next siblings
                 next_element = await page.evaluate('(element) => element.nextElementSibling', header)
                 if next_element:
                     text = await page.evaluate('(element) => element.textContent', next_element)
@@ -418,27 +525,22 @@ class EnhancedPlaywrightScrapingAgent:
         try:
             page_text = await page.text_content('body')
             
-            # Extract rent amount
             rent_match = re.search(r'rent[:\s]*\$?(\d{1,3}(?:,\d{3})*)', page_text, re.IGNORECASE)
             if rent_match:
                 rental_terms['rent'] = f"${rent_match.group(1)}"
             
-            # Extract application fee
             app_fee_match = re.search(r'application\s+fee[:\s]*\$?(\d+)', page_text, re.IGNORECASE)
             if app_fee_match:
                 rental_terms['application_fee'] = f"${app_fee_match.group(1)}"
             
-            # Extract security deposit
             deposit_match = re.search(r'security\s+deposit[:\s]*\$?([\d,]+)', page_text, re.IGNORECASE)
             if deposit_match:
                 rental_terms['security_deposit'] = f"${deposit_match.group(1)}"
             
-            # Extract availability
             avail_match = re.search(r'available[:\s]*([^<\n\r]+)', page_text, re.IGNORECASE)
             if avail_match:
                 rental_terms['availability'] = avail_match.group(1).strip()
             
-            # Extract lease terms
             lease_match = re.search(r'lease[:\s]*([^<\n\r.]+)', page_text, re.IGNORECASE)
             if lease_match:
                 rental_terms['lease_terms'] = lease_match.group(1).strip()
@@ -454,7 +556,6 @@ class EnhancedPlaywrightScrapingAgent:
             page_text = await page.text_content('body')
             page_text_lower = page_text.lower()
             
-            # Positive indicators
             pet_positive = [
                 'pets allowed',
                 'pet friendly', 
@@ -464,7 +565,6 @@ class EnhancedPlaywrightScrapingAgent:
                 'pets: yes'
             ]
             
-            # Negative indicators
             pet_negative = [
                 'no pets',
                 'pets not allowed',
@@ -480,7 +580,6 @@ class EnhancedPlaywrightScrapingAgent:
                 if negative in page_text_lower:
                     return "No"
             
-            # Look for pet policy section
             if 'pet' in page_text_lower:
                 pet_match = re.search(r'pet[s]?[:\s]*([^<\n\r.]{1,50})', page_text_lower)
                 if pet_match:
@@ -492,30 +591,31 @@ class EnhancedPlaywrightScrapingAgent:
         return None
 
     async def scrape_listing_details(self, page: Page, listing_url: str) -> ListingData:
-        """Scrape detailed information from a single listing page with focus on specific keys"""
+        """Scrape detailed information from a single listing page"""
         try:
-            await page.goto(listing_url, wait_until='networkidle', timeout=30000)
+            # Navigate with retry logic
+            if not await self.safe_navigate_to_page(page, listing_url):
+                self.logger.error(f"Failed to navigate to {listing_url}")
+                return ListingData(listing_url=listing_url, scraped_at=datetime.now().isoformat())
+            
             await self.random_delay()
             
-            # Initialize listing data
             listing = ListingData(
                 listing_url=listing_url,
                 scraped_at=datetime.now().isoformat()
             )
             
-            # Get page content for text-based extraction
             page_text = await page.text_content('body')
             
             # Extract TITLE
             listing.title = await self.safe_get_text(page, self.selectors['title'])
             if not listing.title:
                 page_title = await page.title()
-                listing.title = re.sub(r'\s*-\s*.*$', '', page_title)  # Clean up title
+                listing.title = re.sub(r'\s*-\s*.*$', '', page_title)
             
             # Extract ADDRESS
             listing.address = await self.safe_get_text(page, self.selectors['address'])
             if not listing.address and page_text:
-                # Try to find address pattern in page text
                 address_patterns = [
                     r'(\d+[^,\n]*(?:Avenue|Street|Boulevard|Road|Place|Lane|Drive|Way|Court|St|Ave|Blvd|Rd|Pl|Ln|Dr|Ct)[^,\n]*,\s*[^,\n]*(?:,\s*[A-Z]{2})?)',
                     r'Management\s+(\d+[^,\n]*.+?(?:NJ|NY)\s*\d{5})',
@@ -546,11 +646,10 @@ class EnhancedPlaywrightScrapingAgent:
             # Extract DESCRIPTION
             description_text = await self.safe_get_text(page, self.selectors['description'])
             if not description_text:
-                # Try to get the main description paragraph
                 paragraphs = await page.query_selector_all('p')
                 for p in paragraphs:
                     text = await p.text_content()
-                    if text and len(text) > 100:  # Long paragraph likely to be description
+                    if text and len(text) > 100:
                         description_text = text
                         break
             listing.description = description_text
@@ -561,7 +660,6 @@ class EnhancedPlaywrightScrapingAgent:
             # Extract AMENITIES
             utilities = await self.extract_section_content(page, "Utilities")
             if not utilities and page_text:
-                # Extract utilities from general text
                 util_patterns = [
                     r'heat\s*\([^)]*\)',
                     r'water\s*\([^)]*\)', 
@@ -572,17 +670,15 @@ class EnhancedPlaywrightScrapingAgent:
                     matches = re.findall(pattern, page_text, re.IGNORECASE)
                     utilities.extend(matches)
             
-            # Get appliances
             appliances = await self.extract_section_content(page, "Appliances")
             if not appliances and page_text:
-                # Common appliances to look for
                 appliance_keywords = ['refrigerator', 'stove', 'dishwasher', 'microwave', 'washer', 'dryer']
                 for keyword in appliance_keywords:
                     if keyword in page_text.lower():
                         appliances.append(keyword.title())
             
             listing.amenities = {
-                "appliances": list(set(appliances)),  # Remove duplicates
+                "appliances": list(set(appliances)),
                 "utilities_included": list(set(utilities)),
                 "other_amenities": []
             }
@@ -609,18 +705,28 @@ class EnhancedPlaywrightScrapingAgent:
                 listing_dict['source'] = 'tulire_realty'
                 listing_dict['last_updated'] = datetime.now()
                 
-                bulk_operations.append(
-                    pymongo.UpdateOne(
-                        {'_id': listing_dict['_id']},
-                        {'$set': listing_dict},
-                        upsert=True
+                if self.overwrite_data:
+                    bulk_operations.append(
+                        pymongo.ReplaceOne(
+                            {'_id': listing_dict['_id']},
+                            listing_dict,
+                            upsert=True
+                        )
                     )
-                )
+                else:
+                    bulk_operations.append(
+                        pymongo.UpdateOne(
+                            {'_id': listing_dict['_id']},
+                            {'$set': listing_dict},
+                            upsert=True
+                        )
+                    )
             
             if bulk_operations:
                 result = self.collection.bulk_write(bulk_operations)
                 
-                self.logger.info(f"MongoDB Batch Save - Inserted: {result.upserted_count}, Modified: {result.modified_count}")
+                operation_type = "Replaced" if self.overwrite_data else "Inserted/Updated"
+                self.logger.info(f"MongoDB Batch Save - {operation_type}: {result.upserted_count + result.modified_count}")
                 return True
             
         except Exception as e:
@@ -630,13 +736,22 @@ class EnhancedPlaywrightScrapingAgent:
         return False
 
     async def scrape_all_listings(self) -> List[ListingData]:
-        """Main method to scrape ALL listings with batched processing"""
+        """Main method to scrape ALL listings with enhanced error handling"""
         try:
             await self.initialize_browser()
+            
+            if self.overwrite_data and self.save_to_db:
+                if not await self.clear_existing_data():
+                    self.logger.warning("Failed to clear existing data, continuing anyway...")
+            
             page = await self.context.new_page()
             
             self.logger.info("Navigating to listings page...")
-            await page.goto(self.listings_url, wait_until='networkidle')
+            
+            # Navigate with enhanced retry logic
+            if not await self.safe_navigate_to_page(page, self.listings_url):
+                self.logger.error("Failed to navigate to listings page after multiple attempts")
+                return []
             
             # Extract ALL listing URLs with pagination
             listing_urls = await self.extract_listing_urls_with_pagination(page)
@@ -645,14 +760,12 @@ class EnhancedPlaywrightScrapingAgent:
                 self.logger.warning("No listing URLs found")
                 return []
             
-            # Apply max_listings limit if specified
             if self.max_listings:
                 listing_urls = listing_urls[:self.max_listings]
                 self.logger.info(f"Limited to {len(listing_urls)} listings")
             else:
                 self.logger.info(f"Processing ALL {len(listing_urls)} listings")
             
-            # Scrape listings with batch processing
             all_listings = []
             current_batch = []
             
@@ -661,22 +774,19 @@ class EnhancedPlaywrightScrapingAgent:
                     self.logger.info(f"Scraping listing {i}/{len(listing_urls)}: {url}")
                     listing = await self.scrape_listing_details(page, url)
                     
-                    # Only add if we got the compulsory data
                     if listing.title and listing.address:
                         current_batch.append(listing)
                         all_listings.append(listing)
                         
-                        # Save batch when it reaches batch_size
                         if len(current_batch) >= self.batch_size:
                             if self.save_to_db:
                                 await self.save_to_mongodb_batch(current_batch)
-                            current_batch = []  # Reset batch
+                            current_batch = []
                     else:
                         self.logger.warning(f"Missing compulsory data for {url}")
                     
                     await self.random_delay()
                     
-                    # Progress update every 10 listings
                     if i % 10 == 0:
                         self.logger.info(f"Progress: {i}/{len(listing_urls)} completed ({len(all_listings)} valid)")
                     
@@ -704,7 +814,8 @@ class EnhancedPlaywrightScrapingAgent:
         """Save listings to JSON file"""
         if not filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"complete_tulire_listings_{timestamp}.json"
+            mode_prefix = "fresh_" if self.overwrite_data else "complete_"
+            filename = f"{mode_prefix}tulire_listings_{timestamp}.json"
         
         os.makedirs("scraped_data", exist_ok=True)
         filepath = os.path.join("scraped_data", filename)
@@ -753,9 +864,9 @@ class EnhancedPlaywrightScrapingAgent:
         
         return {
             'total_listings': total,
+            'scrape_mode': 'OVERWRITE' if self.overwrite_data else 'UPDATE',
             'data_completeness': {
                 'title': len([l for l in listings if l.title]) / total * 100,
-                'address': len([l for l in listings if l.address]) / total * 100,
                 'price': len([l for l in listings if l.price]) / total * 100,
                 'bedroom': len([l for l in listings if l.bedroom is not None]) / total * 100,
                 'bathroom': len([l for l in listings if l.bathroom is not None]) / total * 100,
@@ -773,36 +884,53 @@ class EnhancedPlaywrightScrapingAgent:
         }
 
 async def main():
-    """Main execution function for complete scraping"""
-    print("🏠 Starting COMPLETE Tulire Listings Scraping Agent...")
+    """Main execution function for complete scraping with overwrite support"""
+    print("ENHANCED TULIRE LISTINGS SCRAPING AGENT WITH DATA OVERWRITE SUPPORT")
     print("Target: ALL available listings with detailed data extraction")
     print("Focus: title, address, price, bedroom, bathroom, description, rental_terms, amenities, pet_friendly")
     print("=" * 100)
     
-    # Configuration for COMPLETE scraping
-    MAX_LISTINGS = None  # Set to None for ALL listings, or set a number for testing
-    HEADLESS = True      # Set to False to see browser in action  
-    SAVE_TO_DB = True    # Save to MongoDB
-    BATCH_SIZE = 20      # Process and save in batches of 20
+    # Configuration for COMPLETE scraping with OVERWRITE option
+    MAX_LISTINGS = None     # Set to None for ALL listings, or set a number for testing
+    HEADLESS = True         # Set to False to see browser in action  
+    SAVE_TO_DB = True       # Save to MongoDB
+    BATCH_SIZE = 20         # Process and save in batches of 20
+    OVERWRITE_DATA = True   # Set to True to completely overwrite existing data
     
     print(f"Configuration:")
     print(f"  - Max Listings: {'ALL AVAILABLE' if MAX_LISTINGS is None else MAX_LISTINGS}")
     print(f"  - Headless Mode: {HEADLESS}")
     print(f"  - Save to MongoDB: {SAVE_TO_DB}")
     print(f"  - Batch Size: {BATCH_SIZE}")
+    print(f"  - Data Mode: {'OVERWRITE (Replace All)' if OVERWRITE_DATA else 'UPDATE (Merge with existing)'}")
     print("-" * 100)
+    
+    if OVERWRITE_DATA:
+        print("WARNING: OVERWRITE MODE ENABLED")
+        print("   - All existing Tulire data in MongoDB will be DELETED")
+        print("   - Fresh scraping will populate the database with new data")
+        print("   - This ensures you have the most current listings without duplicates")
+        
+        if not HEADLESS:
+            response = input("\nContinue with data overwrite? (y/N): ").lower().strip()
+            if response != 'y' and response != 'yes':
+                print("Operation cancelled by user")
+                return
+        
+        print("-" * 100)
     
     agent = EnhancedPlaywrightScrapingAgent(
         headless=HEADLESS,
         max_listings=MAX_LISTINGS,
         save_to_db=SAVE_TO_DB,
-        delay_range=(1.5, 3.5),  # Respectful delay range
-        batch_size=BATCH_SIZE
+        delay_range=(1.5, 3.5),
+        batch_size=BATCH_SIZE,
+        overwrite_data=OVERWRITE_DATA
     )
     
     try:
         start_time = datetime.now()
-        print(f"🚀 Starting scrape at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Starting {'FRESH' if OVERWRITE_DATA else 'UPDATE'} scrape at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         # Scrape all listings
         listings = await agent.scrape_all_listings()
@@ -811,15 +939,16 @@ async def main():
         duration = end_time - start_time
         
         if not listings:
-            print("❌ No listings found. Check complete_tulire_scraper.log for details")
+            print("No listings found. Check the log file for details")
             return
         
         # Display results
-        print(f"\n✅ SCRAPING COMPLETED SUCCESSFULLY!")
+        print(f"\nSCRAPING COMPLETED SUCCESSFULLY!")
         print("=" * 100)
-        print(f"⏱️  Total Time: {duration}")
-        print(f"📊 Total Listings Scraped: {len(listings)}")
-        print(f"📈 Average Time per Listing: {duration.total_seconds() / len(listings):.2f} seconds")
+        print(f"Mode: {'FRESH DATA OVERWRITE' if OVERWRITE_DATA else 'DATA UPDATE/MERGE'}")
+        print(f"Total Time: {duration}")
+        print(f"Total Listings Scraped: {len(listings)}")
+        print(f"Average Time per Listing: {duration.total_seconds() / len(listings):.2f} seconds")
         
         # Generate and save comprehensive report
         summary = agent.generate_summary_report(listings)
@@ -828,50 +957,50 @@ async def main():
         json_file = agent.save_to_json(listings)
         
         # Display comprehensive statistics
-        print(f"\n📋 COMPREHENSIVE SUMMARY REPORT:")
+        print(f"\nCOMPREHENSIVE SUMMARY REPORT:")
         print("-" * 100)
         
         if summary:
             print(f"Total Listings: {summary['total_listings']}")
+            print(f"Scrape Mode: {summary['scrape_mode']}")
             
-            print(f"\n📊 Data Completeness:")
+            print(f"\nData Completeness:")
             for field, percentage in summary['data_completeness'].items():
-                bar_length = int(percentage / 5)  # Scale to 20 chars max
-                bar = "█" * bar_length + "░" * (20 - bar_length)
+                bar_length = int(percentage / 5)
+                bar = "#" * bar_length + "-" * (20 - bar_length)
                 print(f"  {field.replace('_', ' ').title():15} [{bar}] {percentage:.1f}%")
             
             if summary.get('price_analysis'):
                 price = summary['price_analysis']
-                print(f"\n💰 Price Analysis:")
+                print(f"\nPrice Analysis:")
                 print(f"  Minimum Rent: ${price['min']:,}")
                 print(f"  Maximum Rent: ${price['max']:,}")
                 print(f"  Average Rent: ${price['avg']:,}")
                 print(f"  Median Rent:  ${price['median']:,}")
             
             if summary.get('bedroom_distribution'):
-                print(f"\n🛏️  Bedroom Distribution:")
+                print(f"\nBedroom Distribution:")
                 for bedrooms, count in sorted(summary['bedroom_distribution'].items()):
                     bedroom_text = "Studio" if bedrooms == 0 else f"{bedrooms} BR"
                     percentage = (count / summary['total_listings']) * 100
                     print(f"  {bedroom_text:10} {count:3d} listings ({percentage:.1f}%)")
             
             pet_policy = summary.get('pet_policy', {})
-            print(f"\n🐕 Pet Policy Distribution:")
+            print(f"\nPet Policy Distribution:")
             print(f"  Pets Allowed:     {pet_policy.get('allowed', 0):3d} listings")
             print(f"  Pets Not Allowed: {pet_policy.get('not_allowed', 0):3d} listings")  
             print(f"  Policy Unknown:   {pet_policy.get('unknown', 0):3d} listings")
         
         # Display sample listings
-        print(f"\n📝 SAMPLE LISTINGS:")
+        print(f"\nSAMPLE LISTINGS:")
         print("-" * 100)
         
-        # Show 3 sample listings with complete data
         complete_listings = [l for l in listings if l.title and l.address and l.price]
         sample_count = min(3, len(complete_listings))
         
         for i in range(sample_count):
             listing = complete_listings[i]
-            print(f"\n🏠 Sample Listing #{i+1}:")
+            print(f"\nSample Listing #{i+1}:")
             print(f"   Title: {listing.title}")
             print(f"   Address: {listing.address}")
             print(f"   Price: ${listing.price:,}" if listing.price else "   Price: Not specified")
@@ -893,49 +1022,49 @@ async def main():
         
         # Save summary report
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        summary_file = f"scraped_data/tulire_summary_report_{timestamp}.json"
+        mode_prefix = "fresh_" if OVERWRITE_DATA else "update_"
+        summary_file = f"scraped_data/{mode_prefix}tulire_summary_report_{timestamp}.json"
         try:
             with open(summary_file, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
-            print(f"\n💾 Files Saved:")
-            print(f"   📊 Summary Report: {os.path.basename(summary_file)}")
+            print(f"\nFiles Saved:")
+            print(f"   Summary Report: {os.path.basename(summary_file)}")
         except Exception as e:
-            print(f"   ⚠️  Could not save summary report: {e}")
+            print(f"   Could not save summary report: {e}")
         
-        print(f"   🗄️  MongoDB: rental_database.tulire_listings (batched saves)")
+        db_message = "rental_database.tulire_listings (FRESH DATA)" if OVERWRITE_DATA else "rental_database.tulire_listings (UPDATED DATA)"
+        print(f"   MongoDB: {db_message}")
         if json_file:
-            print(f"   📄 Complete Data: {os.path.basename(json_file)}")
+            print(f"   Complete Data: {os.path.basename(json_file)}")
         
         # Final success message
-        print(f"\n🎯 COMPLETE TULIRE SCRAPING FINISHED!")
-        print(f"✨ Successfully processed {len(listings)} listings in {duration}")
-        print(f"🔍 Check the log file 'complete_tulire_scraper.log' for detailed information")
+        mode_text = "FRESH DATA OVERWRITE" if OVERWRITE_DATA else "DATA UPDATE"
+        print(f"\nTULIRE SCRAPING WITH {mode_text} COMPLETED!")
+        print(f"Successfully processed {len(listings)} listings in {duration}")
+        
+        if OVERWRITE_DATA:
+            print(f"Database now contains FRESH data (old data was cleared)")
+        else:
+            print(f"Database has been updated with new/changed listings")
         
         # Performance metrics
         if len(listings) > 50:
-            print(f"\n📈 PERFORMANCE METRICS:")
-            print(f"   ⚡ Listings per minute: {(len(listings) / duration.total_seconds()) * 60:.1f}")
-            print(f"   🎯 Success rate: {(len([l for l in listings if l.title and l.address]) / len(listings)) * 100:.1f}%")
+            print(f"\nPERFORMANCE METRICS:")
+            print(f"   Listings per minute: {(len(listings) / duration.total_seconds()) * 60:.1f}")
+            print(f"   Success rate: {(len([l for l in listings if l.title and l.address]) / len(listings)) * 100:.1f}%")
+        
+        print(f"\nNEXT TIME:")
+        print(f"   - Set OVERWRITE_DATA = True for fresh database replacement")
+        print(f"   - Set OVERWRITE_DATA = False for incremental updates")
         
     except KeyboardInterrupt:
-        print(f"\n⏹️  Scraping interrupted by user")
-        print(f"📊 Partial results may be available in MongoDB and log files")
+        print(f"\nScraping interrupted by user")
+        print(f"Partial results may be available in MongoDB and log files")
         
     except Exception as e:
-        print(f"❌ Fatal Error: {e}")
+        print(f"Fatal Error: {e}")
         import traceback
-        print(f"🔍 Traceback: {traceback.format_exc()}")
-        print(f"💡 Check complete_tulire_scraper.log for more details")
+        print(f"Traceback: {traceback.format_exc()}")
 
-if __name__ == "__main__":
-    # Required packages:
-    # pip install playwright pymongo python-dotenv certifi
-    # playwright install chromium
-    
-    print("🔧 Required Setup:")
-    print("   pip install playwright pymongo python-dotenv certifi")
-    print("   playwright install chromium")
-    print("   Set MONGODB_URL_KEY in your .env file")
-    print()
-    
+if __name__ == "__main__":    
     asyncio.run(main())

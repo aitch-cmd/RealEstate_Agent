@@ -1,8 +1,5 @@
 scraped_data/
-scraper.log
 venv/
-debug_page.html
 .env
 __pycache__/
-complete_tulire_scraper.log
-enhanced_tulire_scraper.log
+/logs

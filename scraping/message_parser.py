@@ -53,7 +53,7 @@ class UserMessageParser:
         })
 
 if __name__ == "__main__":
-    extractor = UserMessageExtractor()
+    extractor = UserMessageParser()
     msg = "Show me 2BHK flats in Bangalore under 20k"
     result = extractor.extract(msg)
     print(result)

@@ -6,3 +6,4 @@ python-dotenv
 streamlit
 playwright
 pymongo
+sentence-transformers
