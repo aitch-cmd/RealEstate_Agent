@@ -432,25 +432,16 @@ class EnhancedPlaywrightScrapingAgent:
         except Exception as e:
             self.logger.error(f"Error extracting listing URLs: {e}")
             return all_urls
-
-    def extract_price_from_text(self, text: str) -> Optional[int]:
-        """Extract price from text with multiple patterns"""
-        if not text:
+    
+    def extract_price_from_text(self, price_text: str) -> Optional[int]:
+        """Extract numeric price from price text"""
+        if not price_text:
             return None
         
-        patterns = [
-            r'\$(\d{1,3}(?:,\d{3})*)',
-            r'(\d{1,3}(?:,\d{3})*)\s*(?:/mo|per month)',
-            r'rent[:\s]*\$?(\d{1,3}(?:,\d{3})*)',
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, text.replace(',', ''), re.IGNORECASE)
-            if matches:
-                try:
-                    return int(matches[0].replace(',', ''))
-                except ValueError:
-                    continue
+        # Remove $ and commas, extract numbers
+        price_match = re.search(r'\$?([\d,]+)', price_text.replace(',', ''))
+        if price_match:
+            return int(price_match.group(1).replace(',', ''))
         return None
 
     def extract_bed_bath_from_text(self, text: str) -> Dict[str, Optional[float]]:
