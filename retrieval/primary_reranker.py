@@ -4,6 +4,9 @@ import logging
 import yaml
 
 class PrimaryHybridReranker:
+    """For handling the listings if it is less than 5."""
+
+    @staticmethod
     def load_params(params_path: str) -> dict:
         """Load parameters from a YAML file."""
         try:
