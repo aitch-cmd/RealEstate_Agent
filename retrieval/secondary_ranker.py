@@ -1,6 +1,6 @@
 from sentence_transformers import SentenceTransformer, util
 from typing import List, Dict
-from retrieval.primary_reranker import PrimaryHybridReranker
+from retrieval.primary_ranker import PrimaryHybridReranker
 
 class SecondaryHybridReranker:
     """
@@ -8,7 +8,7 @@ class SecondaryHybridReranker:
     Combines embedding-based semantic similarity with user preference keyword matching.
     """
 
-    CONFIG = PrimaryHybridReranker.load_params("params.yaml")["secondary_reranker"]
+    CONFIG = PrimaryHybridReranker.load_params("params.yaml")["secondary_ranker"]
 
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
                  alpha: float = CONFIG["alpha"], beta: float = CONFIG["beta"]):
@@ -58,7 +58,7 @@ class SecondaryHybridReranker:
         # Encode the user query into an embedding for semantic similarity
         query_emb = self.embedder.encode(rag_content, convert_to_tensor=True)
 
-        reranked = []
+        scores = []
         for c in candidates:
             # Build a textual representation of the listing
             text = self.build_listing_text(c)
@@ -74,11 +74,14 @@ class SecondaryHybridReranker:
 
             # 3. Final hybrid score
             final_score = self.alpha * emb_score + self.beta * pref_score
+            scores.append(final_score)
 
-            # Attach the score to the listing
-            reranked.append({**c, "score": final_score})
+        # Sort candidates by score without attaching it
+        sorted_candidates = [
+            c for _, c in sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+        ]
 
-        return sorted(reranked, key=lambda x: x["score"], reverse=True)[:4]
+        return sorted_candidates[:4]
 
 if __name__ == "__main__":
     # Example user query

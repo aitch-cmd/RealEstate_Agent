@@ -7,3 +7,5 @@ streamlit
 playwright
 pymongo
 sentence-transformers
+torch
+transformers
