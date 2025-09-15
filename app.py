@@ -1,31 +1,28 @@
-import streamlit as st
+from flask import Flask, request, render_template
 from pipeline import RentalPipeline
 from rental_agent import RentalAgent
 
-# Initialize pipeline + chatbot once
-if "pipeline" not in st.session_state:
-    st.session_state.pipeline = RentalPipeline()
-if "agent" not in st.session_state:
-    st.session_state.agent = RentalAgent()
+# Initialize pipeline and agent
+pipeline = RentalPipeline()
+agent = RentalAgent()
 
-st.title("🏠 Rental Chatbot")
+app = Flask(__name__)
 
-# Input box
-user_input = st.text_input("Ask about rentals:",)
+@app.route("/")
+def home():
+    return render_template("index.html")
 
-# Process on button click
-if st.button("Send") and user_input:
-    with st.spinner("Searching the best listings..."):
-        # Step 1: pipeline produces final listings
-        final_listings = st.session_state.pipeline.process_user_message(user_input)
+@app.route("/search", methods=["POST"])
+def search():
+    data = request.get_json()
+    if not data or "query" not in data:
+        return "Error: No query provided.", 400
 
-        # Step 2: agent generates natural response
-        response = st.session_state.agent.generate_response(user_input, final_listings)
+    user_input = data["query"]
+    final_listings = pipeline.process_user_message(user_input)
+    response = agent.generate_response(user_input, final_listings)
 
-    # Show results
-    st.subheader("Bot Response")
-    st.write(response)
+    return str(response)
 
-    # Optionally preview raw listings
-    with st.expander("See retrieved listings"):
-        st.json(final_listings)
+if __name__ == "__main__":
+    app.run(debug=True)

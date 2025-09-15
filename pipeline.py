@@ -35,7 +35,4 @@ class RentalPipeline:
         # Step 4: Rerank listings using cross-encoder 
         reranked_listings = self.cross_encoder_reranker.rerank(parsed_message, ranked_listings)
 
-        # Step 5 Use the agent to finalize the listings (mocked here)
-        final_listings = self.agent.finalize_listings(reranked_listings)
-
-        return final_listings
+        return reranked_listings

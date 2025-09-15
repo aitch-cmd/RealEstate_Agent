@@ -16,26 +16,30 @@ class MongoDBFilter:
         except OperationFailure as e:
             print(f"Index creation failed: {e}")
 
-    def build_query(self, parsed_message: dict) -> dict:
-        """
-        Build a MongoDB query using extracted info from user message.
-        Uses $text for title search (case-insensitive) and numeric filter for rent_price.
-        """
-        query = {}
+        def build_query(self, parsed_message: dict) -> dict:
+            """
+            Build a MongoDB query using extracted info from user message.
+            Uses $text for title search (case-insensitive) and numeric filter for rent_price.
+            """
+            query = {}
 
-        # Location/title search using $text
-        if parsed_message.get("location"):
-            query["$text"] = {"$search": parsed_message["location"]}
+            # Location/title search using $text
+            if parsed_message.get("location"):
+                query["$text"] = {"$search": parsed_message["location"]}
 
-        # Rent price filter
-        if parsed_message.get("price"):
-            try:
-                price_val = int(parsed_message["price"])
-                query["rent_price"] = {"$lte": price_val}
-            except ValueError:
-                print(f"Invalid price value: {parsed_message['price']}")
+            # Rent price filter
+            if parsed_message.get("price"):
+                try:
+                    # Remove non-digit characters (like $, commas, words)
+                    price_str = "".join(ch for ch in str(parsed_message["price"]) if ch.isdigit())
+                    if price_str:  
+                        price_val = int(price_str)
+                        query["rent_price"] = {"$lte": price_val}
+                except (ValueError, TypeError):
+                    print(f"⚠️ Invalid price value: {parsed_message['price']}")
 
-        return query
+            return query
+
     
     def search_rentals(self, user_message: str):
         """

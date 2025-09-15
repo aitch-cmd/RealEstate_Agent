@@ -3,9 +3,10 @@ beautifulsoup4
 lxml
 langchain-google-genai
 python-dotenv
-streamlit
+flask
 playwright
 pymongo
 sentence-transformers
 torch
 transformers
+flask
