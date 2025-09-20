@@ -16,7 +16,7 @@ class MongoDBFilter:
         except OperationFailure as e:
             print(f"Index creation failed: {e}")
 
-        def build_query(self, parsed_message: dict) -> dict:
+    def build_query(self, parsed_message: dict) -> dict:
             """
             Build a MongoDB query using extracted info from user message.
             Uses $text for title search (case-insensitive) and numeric filter for rent_price.

@@ -47,7 +47,8 @@ class RentalAgent:
 
         If a user asks details about a specific listing, provide the details if present in the listing.  
         **Special Note**: Make sure to list the listings in the order they were provided.                                                 
-
+                                                                
+        Give the answer in proper format with bullet points for each listing.
         If no listings are found, politely explain that and suggest trying another query.
         """)
 
